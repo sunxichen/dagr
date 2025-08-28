@@ -7,9 +7,9 @@ from yolox.models import YOLOX, YOLOXHead, IOUloss
 
 from dagr.model.networks.net import Net
 try:
-    from dagr.model.networks.snn_backbone import SNNBackboneWrapper
+    from dagr.model.networks.snn_backbone_yaml import SNNBackboneYAMLWrapper
 except Exception:
-    SNNBackboneWrapper = None
+    SNNBackboneYAMLWrapper = None
 from dagr.model.layers.spline_conv import SplineConvToDense
 from dagr.model.layers.conv import ConvBlock
 from dagr.model.utils import shallow_copy, init_subnetwork, voxel_size_to_params, postprocess_network_output, convert_to_evaluation_format, init_grid_and_stride, convert_to_training_format
@@ -23,10 +23,12 @@ class DAGR(YOLOX):
         self.height = height
         self.width = width
 
-        use_snn = hasattr(args, 'use_snn_backbone') and getattr(args, 'use_snn_backbone') and SNNBackboneWrapper is not None
+        use_snn = hasattr(args, 'use_snn_backbone') and getattr(args, 'use_snn_backbone') and SNNBackboneYAMLWrapper is not None
 
         if use_snn:
-            backbone = SNNBackboneWrapper(args, height=height, width=width)
+            yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
+            scale = getattr(args, 'snn_scale', 's')
+            backbone = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
             head = CNNHead(num_classes=backbone.num_classes,
                            strides=backbone.strides,
                            in_channels=backbone.out_channels)
