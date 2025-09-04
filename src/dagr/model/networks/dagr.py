@@ -24,14 +24,16 @@ class DAGR(YOLOX):
         self.width = width
 
         use_snn = hasattr(args, 'use_snn_backbone') and getattr(args, 'use_snn_backbone') and SNNBackboneYAMLWrapper is not None
+        print(f"Debug: use_snn: {use_snn}")
 
         if use_snn:
             yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
             scale = getattr(args, 'snn_scale', 's')
             backbone = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
-            head = CNNHead(num_classes=backbone.num_classes,
-                           strides=backbone.strides,
-                           in_channels=backbone.out_channels)
+            head = YOLOXHead(num_classes=backbone.num_classes,
+                             width=1.0,
+                             strides=backbone.strides,
+                             in_channels=backbone.out_channels)
         else:
             backbone = Net(args, height=height, width=width)
             head = GNNHead(num_classes=backbone.num_classes,

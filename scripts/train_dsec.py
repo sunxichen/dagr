@@ -2,6 +2,13 @@
 import os
 os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
 
+# HDF5: avoid missing VOL/filter plugin issues in worker processes
+for k in ('HDF5_VOL_CONNECTOR', 'HDF5_PLUGIN_PATH'):
+    os.environ.pop(k, None)
+
+import hdf5plugin
+import h5py
+
 import torch
 import tqdm
 import wandb
@@ -9,6 +16,7 @@ from pathlib import Path
 import argparse
 
 from torch_geometric.data import DataLoader
+from torch.utils.data import Subset
 
 from dagr.utils.logging import Checkpointer, set_up_logging_directory, log_hparams
 from dagr.utils.buffers import DetectionBuffer
@@ -81,7 +89,12 @@ def run_test(loader: DataLoader,
 
     model.eval()
 
-    mapcalc = DetectionBuffer(height=loader.dataset.height, width=loader.dataset.width, classes=loader.dataset.classes)
+    # Unwrap Subset to access base dataset attributes
+    base_dataset = loader.dataset
+    while isinstance(base_dataset, Subset):
+        base_dataset = base_dataset.dataset
+
+    mapcalc = DetectionBuffer(height=base_dataset.height, width=base_dataset.width, classes=base_dataset.classes)
 
     for i, data in enumerate(tqdm.tqdm(loader)):
         data = data.cuda()
@@ -127,11 +140,32 @@ if __name__ == '__main__':
     test_dataset = DSEC(root=dataset_path, split="val", transform=augmentations.transform_testing, debug=False,
                         min_bbox_diag=15, min_bbox_height=10)
 
+    # Fast-trend: fixed small subsets and high-frequency eval
+    # Use first N samples to accelerate trend validation
+    TRAIN_SUB_N = 5000
+    VAL_SUB_N = 1000
+
+    if len(train_dataset) > TRAIN_SUB_N:
+        train_indices = list(range(TRAIN_SUB_N))
+        train_dataset = Subset(train_dataset, train_indices)
+        print(f"[FastTrend] Using train subset: {len(train_indices)} / original")
+
+    if len(test_dataset) > VAL_SUB_N:
+        val_indices = list(range(VAL_SUB_N))
+        test_dataset_fast = Subset(test_dataset, val_indices)
+        print(f"[FastTrend] Using val subset: {len(val_indices)} / original for frequent eval")
+    else:
+        test_dataset_fast = test_dataset
+
     train_loader = DataLoader(train_dataset, follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
     num_iters_per_epoch = len(train_loader)
 
-    sampler = np.random.permutation(np.arange(len(test_dataset)))
-    test_loader = DataLoader(test_dataset, sampler=sampler, follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
+    sampler = np.random.permutation(np.arange(len(test_dataset_fast)))
+    test_loader_fast = DataLoader(test_dataset_fast, sampler=sampler, follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
+
+    # optional full validation every few epochs
+    HAVE_FULL = True
+    test_loader_full = DataLoader(test_dataset, sampler=np.random.permutation(np.arange(len(test_dataset))), follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
 
     print("init net")
     # load a dummy sample to get height, width
@@ -166,19 +200,31 @@ if __name__ == '__main__':
         print(f"Resume from checkpoint at epoch {start_epoch}")
 
     with torch.no_grad():
-        mapcalc = run_test(test_loader, ema.ema, dry_run_steps=2, dataset=args.dataset)
-        mapcalc.compute()
+        mapcalc = run_test(test_loader_fast, ema.ema, dry_run_steps=1, dataset=args.dataset)
+        metrics_pre = mapcalc.compute()
+        # print concise warmup evaluation summary to console
+        summary_keys = ['mAP', 'mAP_50', 'mAP_75', 'mAP_S', 'mAP_M', 'mAP_L']
+        summary_parts = []
+        for k in summary_keys:
+            if k in metrics_pre:
+                try:
+                    summary_parts.append(f"{k}={metrics_pre[k]:.4f}")
+                except Exception:
+                    summary_parts.append(f"{k}={metrics_pre[k]}")
+        if summary_parts:
+            print("[Eval][Warmup] " + ", ".join(summary_parts), flush=True)
 
     print("starting to train")
     for epoch in range(start_epoch, args.tot_num_epochs):
         train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
         checkpointer.checkpoint(epoch, name=f"last_model")
 
-        if epoch % 3 > 0:
-            continue
-
+        # eval every epoch on fast val; full val every 5 epochs
         with torch.no_grad():
-            mapcalc = run_test(test_loader, ema.ema, dataset=args.dataset)
+            if HAVE_FULL and (epoch % 5 == 0):
+                mapcalc = run_test(test_loader_full, ema.ema, dataset=args.dataset)
+            else:
+                mapcalc = run_test(test_loader_fast, ema.ema, dataset=args.dataset)
             metrics = mapcalc.compute()
             checkpointer.process(metrics, epoch)
 

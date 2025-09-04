@@ -48,27 +48,36 @@ def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False) -> Tu
         if module is MS_GetT:
             c1 = ch_list[f]
             c2 = args[0]
+            # Guard: MS_GetT should only appear at the first layer
+            if i != 0:
+                raise ValueError('MS_GetT is only allowed at the first layer (i == 0).')
             mod_args = [c1, c2, *args[1:]]
+            c_out = c1
         elif module is MS_CancelT:
             c1 = ch_list[f]
             c2 = args[0]
             mod_args = [c1, c2, *args[1:]]
+            c_out = c1
         elif module is MS_DownSampling:
             c1 = ch_list[f]
             c2 = _make_divisible(min(int(args[0] * width), int(max_channels)))
             mod_args = [c1, c2, *args[1:]]
+            c_out = c2
         elif module in (MS_ConvBlock, MS_AllConvBlock):
             c1 = ch_list[f]
             c2 = c1
             mod_args = [c1, *args]
+            c_out = c1
         elif module is MS_StandardConv:
             c1 = ch_list[f]
             c2 = _make_divisible(min(int(args[0] * width), int(max_channels)))
             mod_args = [c1, c2, *args[1:]]
+            c_out = c2
         elif module is SpikeSPPF:
             c1 = ch_list[f]
             c2 = args[0]
             mod_args = [c1, c2, *args[1:]]
+            c_out = c2
         else:
             raise NotImplementedError(f'Module {m} not supported in backbone parser')
 
@@ -77,8 +86,8 @@ def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False) -> Tu
         layers.append(m_)
         save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
 
-        # track ch out (MS_GetT sets out_channels to args[0])
-        ch_list.append(mod_args[1])
+        # track output channels correctly per module
+        ch_list.append(c_out)
 
         # tap indices for P3/P4/P5 based on YAML order (indices 4,6,9 after parse)
         if i in (4, 6, 9):

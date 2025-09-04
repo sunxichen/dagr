@@ -89,6 +89,16 @@ class Checkpointer:
 
     def process(self, data: Dict[str, float], epoch: int):
         mAP = data['mAP']
+        summary_keys = ['mAP', 'mAP_50', 'mAP_75', 'mAP_S', 'mAP_M', 'mAP_L']
+        summary_parts = []
+        for k in summary_keys:
+            if k in data:
+                try:
+                    summary_parts.append(f"{k}={data[k]:.4f}")
+                except Exception:
+                    summary_parts.append(f"{k}={data[k]}")
+        if summary_parts:
+            print(f"[Eval][Epoch {epoch}] " + ", ".join(summary_parts), flush=True)
         data = {f"validation/metric/{k}": v for k, v in data.items()}
         data['epoch'] = epoch
         wandb.log(data)

@@ -49,6 +49,11 @@ def BASE_FLAGS():
 
     parser.add_argument('--aug_p_flip', default=argparse.SUPPRESS, type=float)
 
+    # SNN backbone options
+    parser.add_argument("--use_snn_backbone", action="store_true", help="Enable SNN backbone defined by a YAML config")
+    parser.add_argument("--snn_yaml_path", default=argparse.SUPPRESS, type=str, help="Path to SNN YAML config file")
+    parser.add_argument("--snn_scale", default=argparse.SUPPRESS, type=str, help="Model scale for SNN backbone (e.g., s/m/l)")
+
     return parser
 
 def FLAGS():
