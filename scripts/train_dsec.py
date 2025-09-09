@@ -57,6 +57,9 @@ def train(loader: DataLoader,
 
     model.train()
 
+    total_loss_sum = 0.0
+    num_steps = 0
+
     for i, data in enumerate(tqdm.tqdm(loader, desc=f"Training {run_name}")):
         data = data.cuda(non_blocking=True)
         data = format_data(data)
@@ -81,6 +84,14 @@ def train(loader: DataLoader,
 
         training_logs = {f"training/loss/{k}": v for k, v in loss_dict.items()}
         wandb.log({"training/loss": loss.item(), "training/lr": scheduler.get_last_lr()[-1], **training_logs})
+
+        # accumulate for epoch mean
+        total_loss_sum += float(loss.item())
+        num_steps += 1
+
+    # return mean loss for console print
+    mean_loss = total_loss_sum / max(1, num_steps)
+    return mean_loss
 
 def run_test(loader: DataLoader,
          model: torch.nn.Module,
@@ -140,32 +151,45 @@ if __name__ == '__main__':
     test_dataset = DSEC(root=dataset_path, split="val", transform=augmentations.transform_testing, debug=False,
                         min_bbox_diag=15, min_bbox_height=10)
 
-    # Fast-trend: fixed small subsets and high-frequency eval
-    # Use first N samples to accelerate trend validation
+    # Experiment trend modes: fast / mid / full
+    # fast: train+val use subsets; evaluate every epoch on fast subset, no full eval
+    # mid: train full; eval every epoch on fast subset AND every 3 epochs on full
+    # full: train full; eval only every 3 epochs on full (no fast subset)
+
+    EXP_TREND = getattr(args, 'exp_trend', 'fast')
     TRAIN_SUB_N = 5000
     VAL_SUB_N = 1000
 
-    if len(train_dataset) > TRAIN_SUB_N:
+    use_train_subset = (EXP_TREND == 'fast')
+    use_val_fast_subset = (EXP_TREND in ('fast', 'mid'))
+    full_eval_every_n_epochs = 3 if EXP_TREND in ('mid', 'full') else None
+
+    if use_train_subset and len(train_dataset) > TRAIN_SUB_N:
         train_indices = list(range(TRAIN_SUB_N))
         train_dataset = Subset(train_dataset, train_indices)
-        print(f"[FastTrend] Using train subset: {len(train_indices)} / original")
+        print(f"[FastTrend] Using train subset: {len(train_indices)} / original", flush=True)
 
-    if len(test_dataset) > VAL_SUB_N:
-        val_indices = list(range(VAL_SUB_N))
-        test_dataset_fast = Subset(test_dataset, val_indices)
-        print(f"[FastTrend] Using val subset: {len(val_indices)} / original for frequent eval")
-    else:
-        test_dataset_fast = test_dataset
+    # Always have full validation dataset
+    test_dataset_full = test_dataset
+    test_dataset_fast = None
+    if use_val_fast_subset:
+        if len(test_dataset) > VAL_SUB_N:
+            val_indices = list(range(VAL_SUB_N))
+            test_dataset_fast = Subset(test_dataset, val_indices)
+            print(f"[FastTrend] Using val subset: {len(val_indices)} / original for frequent eval", flush=True)
+        else:
+            test_dataset_fast = test_dataset
 
     train_loader = DataLoader(train_dataset, follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=True, num_workers=4, drop_last=True)
     num_iters_per_epoch = len(train_loader)
 
-    sampler = np.random.permutation(np.arange(len(test_dataset_fast)))
-    test_loader_fast = DataLoader(test_dataset_fast, sampler=sampler, follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
+    # Build validation loaders per configured datasets
+    test_loader_fast = None
+    if test_dataset_fast is not None:
+        sampler = np.random.permutation(np.arange(len(test_dataset_fast)))
+        test_loader_fast = DataLoader(test_dataset_fast, sampler=sampler, follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
 
-    # optional full validation every few epochs
-    HAVE_FULL = True
-    test_loader_full = DataLoader(test_dataset, sampler=np.random.permutation(np.arange(len(test_dataset))), follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
+    test_loader_full = DataLoader(test_dataset_full, sampler=np.random.permutation(np.arange(len(test_dataset_full))), follow_batch=['bbox', 'bbox0'], batch_size=args.batch_size, shuffle=False, num_workers=4, drop_last=True)
 
     print("init net")
     # load a dummy sample to get height, width
@@ -199,8 +223,13 @@ if __name__ == '__main__':
         start_epoch = checkpointer.restore_checkpoint(args.resume_checkpoint, best=False)
         print(f"Resume from checkpoint at epoch {start_epoch}")
 
+    # Warmup evaluation based on exp_trend
     with torch.no_grad():
-        mapcalc = run_test(test_loader_fast, ema.ema, dry_run_steps=1, dataset=args.dataset)
+        if EXP_TREND == 'full':
+            warmup_loader = test_loader_full
+        else:
+            warmup_loader = test_loader_fast if test_loader_fast is not None else test_loader_full
+        mapcalc = run_test(warmup_loader, ema.ema, dry_run_steps=1, dataset=args.dataset)
         metrics_pre = mapcalc.compute()
         # print concise warmup evaluation summary to console
         summary_keys = ['mAP', 'mAP_50', 'mAP_75', 'mAP_S', 'mAP_M', 'mAP_L']
@@ -216,15 +245,31 @@ if __name__ == '__main__':
 
     print("starting to train")
     for epoch in range(start_epoch, args.tot_num_epochs):
-        train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
+        mean_loss = train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=wandb.run.name)
+        try:
+            current_lr = lr_scheduler.get_last_lr()[-1]
+        except Exception:
+            current_lr = optimizer.param_groups[0]['lr']
+        print(f"[Train][Epoch {epoch}] loss={mean_loss:.6f}, lr={current_lr:.6g}", flush=True)
         checkpointer.checkpoint(epoch, name=f"last_model")
 
-        # eval every epoch on fast val; full val every 5 epochs
+        # Evaluation scheduling per exp_trend
         with torch.no_grad():
-            if HAVE_FULL and (epoch % 5 == 0):
-                mapcalc = run_test(test_loader_full, ema.ema, dataset=args.dataset)
-            else:
-                mapcalc = run_test(test_loader_fast, ema.ema, dataset=args.dataset)
-            metrics = mapcalc.compute()
-            checkpointer.process(metrics, epoch)
+            if EXP_TREND == 'fast':
+                if test_loader_fast is not None:
+                    mapcalc = run_test(test_loader_fast, ema.ema, dataset=args.dataset)
+                    metrics = mapcalc.compute()
+                    checkpointer.process(metrics, epoch)
+            elif EXP_TREND == 'mid':
+                if (epoch % 3 == 0):
+                    mapcalc = run_test(test_loader_full, ema.ema, dataset=args.dataset)
+                else:
+                    mapcalc = run_test(test_loader_fast, ema.ema, dataset=args.dataset)
+                metrics = mapcalc.compute()
+                checkpointer.process(metrics, epoch)
+            elif EXP_TREND == 'full':
+                if (epoch % 3 == 0):
+                    mapcalc = run_test(test_loader_full, ema.ema, dataset=args.dataset)
+                    metrics = mapcalc.compute()
+                    checkpointer.process(metrics, epoch)
 

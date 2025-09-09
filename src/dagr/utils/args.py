@@ -69,6 +69,9 @@ def FLAGS():
 
     parser.add_argument('--run_test', action="store_true")
 
+    # experiment trend: controls data subsampling and evaluation frequency
+    parser.add_argument('--exp_trend', default='fast', type=str, choices=['fast', 'mid', 'full'])
+
     parser.add_argument('--num_interframe_steps', type=int, default=10)
 
     args = parser.parse_args()

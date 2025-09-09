@@ -21,14 +21,16 @@ EXP_NAME=snn_yaml_s_fasttrend
 SNN_YAML=src/dagr/cfg/snn_yolov8.yaml
 SNN_SCALE=s
 
-# Hyperparameters (adjust as needed)
-BATCH_SIZE=32
-EPOCHS=10
-LR=0.001
-WEIGHT_DECAY=0.0005
+# Hyperparameters (default to config's baseline)
+BATCH_SIZE=64
+EPOCHS=801
+LR=0.0002
+WEIGHT_DECAY=0.00001
 
 # Dataset settings (adjust DATASET_DIR if needed)
 DATASET=dsec
+# Experiment trend mode: fast | mid | full
+EXP_TREND=full
 # If FLAGS expects a dataset directory, set it via --dataset_directory
 # Example: DATASET_DIR=/path/to/DSEC
 DATASET_DIR=/root/autodl-tmp
@@ -49,6 +51,7 @@ $PYTHON "$TRAIN_SCRIPT" \
   --tot_num_epochs "$EPOCHS" \
   --l_r "$LR" \
   --weight_decay "$WEIGHT_DECAY" \
+  --exp_trend "$EXP_TREND" \
   --use_snn_backbone \
   --snn_yaml_path "$SNN_YAML" \
   --snn_scale "$SNN_SCALE" \
