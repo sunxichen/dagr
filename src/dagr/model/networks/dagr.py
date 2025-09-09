@@ -6,6 +6,10 @@ from torch_geometric.data import Data
 from yolox.models import YOLOX, YOLOXHead, IOUloss
 
 from dagr.model.networks.net import Net
+try:
+    from dagr.model.networks.snn_backbone_yaml import SNNBackboneYAMLWrapper
+except Exception:
+    SNNBackboneYAMLWrapper = None
 from dagr.model.layers.spline_conv import SplineConvToDense
 from dagr.model.layers.conv import ConvBlock
 from dagr.model.utils import shallow_copy, init_subnetwork, voxel_size_to_params, postprocess_network_output, convert_to_evaluation_format, init_grid_and_stride, convert_to_training_format
@@ -19,13 +23,25 @@ class DAGR(YOLOX):
         self.height = height
         self.width = width
 
-        backbone = Net(args, height=height, width=width)
-        head = GNNHead(num_classes=backbone.num_classes,
-                       in_channels=backbone.out_channels,
-                       in_channels_cnn=backbone.out_channels_cnn,
-                       strides=backbone.strides,
-                       pretrain_cnn=args.pretrain_cnn,
-                       args=args)
+        use_snn = hasattr(args, 'use_snn_backbone') and getattr(args, 'use_snn_backbone') and SNNBackboneYAMLWrapper is not None
+        print(f"Debug: use_snn: {use_snn}")
+
+        if use_snn:
+            yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
+            scale = getattr(args, 'snn_scale', 's')
+            backbone = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
+            head = YOLOXHead(num_classes=backbone.num_classes,
+                             width=1.0,
+                             strides=backbone.strides,
+                             in_channels=backbone.out_channels)
+        else:
+            backbone = Net(args, height=height, width=width)
+            head = GNNHead(num_classes=backbone.num_classes,
+                           in_channels=backbone.out_channels,
+                           in_channels_cnn=backbone.out_channels_cnn,
+                           strides=backbone.strides,
+                           pretrain_cnn=args.pretrain_cnn,
+                           args=args)
 
         super().__init__(backbone=backbone, head=head)
 
@@ -35,41 +51,43 @@ class DAGR(YOLOX):
             init_subnetwork(self, state_dict['ema'], "head.cnn_head.")
 
     def cache_luts(self, width, height, radius):
-        M = 2 * float(int(radius * width + 2) / width)
-        r = int(radius * width+1)
-        self.backbone.conv_block1.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=r)
-        self.backbone.conv_block1.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=r)
+        # LUTs are specific to graph-based spline convs; skip when using SNN backbone.
+        if isinstance(self.backbone, Net):
+            M = 2 * float(int(radius * width + 2) / width)
+            r = int(radius * width+1)
+            self.backbone.conv_block1.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=r)
+            self.backbone.conv_block1.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=r)
 
-        rx, ry, M = voxel_size_to_params(self.backbone.pool1, height, width)
-        self.backbone.layer2.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-        self.backbone.layer2.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            rx, ry, M = voxel_size_to_params(self.backbone.pool1, height, width)
+            self.backbone.layer2.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.backbone.layer2.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
 
-        rx, ry, M = voxel_size_to_params(self.backbone.pool2, height, width)
-        self.backbone.layer3.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-        self.backbone.layer3.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            rx, ry, M = voxel_size_to_params(self.backbone.pool2, height, width)
+            self.backbone.layer3.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.backbone.layer3.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
 
-        rx, ry, M = voxel_size_to_params(self.backbone.pool3, height, width)
-        self.backbone.layer4.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-        self.backbone.layer4.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            rx, ry, M = voxel_size_to_params(self.backbone.pool3, height, width)
+            self.backbone.layer4.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.backbone.layer4.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
 
-        self.head.stem1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-        self.head.cls_conv1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-        self.head.reg_conv1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-        self.head.cls_pred1.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-        self.head.reg_pred1.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-        self.head.obj_pred1.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.head.stem1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.head.cls_conv1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.head.reg_conv1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.head.cls_pred1.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.head.reg_pred1.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.head.obj_pred1.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
 
-        rx, ry, M = voxel_size_to_params(self.backbone.pool4, height, width)
-        self.backbone.layer5.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-        self.backbone.layer5.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            rx, ry, M = voxel_size_to_params(self.backbone.pool4, height, width)
+            self.backbone.layer5.conv_block1.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            self.backbone.layer5.conv_block2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
 
-        if self.head.num_scales > 1:
-            self.head.stem2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-            self.head.cls_conv2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-            self.head.reg_conv2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-            self.head.cls_pred2.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-            self.head.reg_pred2.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
-            self.head.obj_pred2.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+            if self.head.num_scales > 1:
+                self.head.stem2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+                self.head.cls_conv2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+                self.head.reg_conv2.conv.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+                self.head.cls_pred2.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+                self.head.reg_pred2.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
+                self.head.obj_pred2.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
 
     def forward(self, x: Data, reset=True, return_targets=True, filtering=True):
         if not hasattr(self.head, "output_sizes"):
