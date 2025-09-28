@@ -10,6 +10,10 @@ try:
     from dagr.model.networks.snn_backbone_yaml import SNNBackboneYAMLWrapper
 except Exception:
     SNNBackboneYAMLWrapper = None
+try:
+    from dagr.model.networks.hybrid_backbone import HybridBackbone
+except Exception:
+    HybridBackbone = None
 from dagr.model.layers.spline_conv import SplineConvToDense
 from dagr.model.layers.conv import ConvBlock
 from dagr.model.utils import shallow_copy, init_subnetwork, voxel_size_to_params, postprocess_network_output, convert_to_evaluation_format, init_grid_and_stride, convert_to_training_format
@@ -26,7 +30,13 @@ class DAGR(YOLOX):
         use_snn = hasattr(args, 'use_snn_backbone') and getattr(args, 'use_snn_backbone') and SNNBackboneYAMLWrapper is not None
         print(f"Debug: use_snn: {use_snn}")
 
-        if use_snn:
+        if use_snn and getattr(args, 'use_image', False) and HybridBackbone is not None:
+            backbone = HybridBackbone(args, height=height, width=width)
+            head = HybridHead(num_classes=backbone.num_classes,
+                             strides=backbone.strides,
+                             in_channels=backbone.out_channels,
+                             args=args)
+        elif use_snn:
             yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
             scale = getattr(args, 'snn_scale', 's')
             backbone = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
@@ -139,6 +149,84 @@ class CNNHead(YOLOXHead):
 
         return outputs
 
+
+class HybridHead(YOLOXHead):
+    def __init__(self, num_classes, strides=[16, 32], in_channels=[256, 512], act="silu", depthwise=False, args=None):
+        YOLOXHead.__init__(self, num_classes, args.yolo_stem_width, strides, in_channels, act, depthwise)
+        self.strides = strides
+        self.num_scales = len(in_channels)
+        # Image-only head for auxiliary supervision
+        self.image_head = CNNHead(num_classes=num_classes, strides=strides, in_channels=in_channels)
+
+    def _forward_single(self, xin):
+        outputs = dict(cls_output=[], reg_output=[], obj_output=[])
+        for k, (cls_conv, reg_conv, x) in enumerate(zip(self.cls_convs, self.reg_convs, xin)):
+            x = self.stems[k](x)
+            cls_x = x
+            reg_x = x
+            cls_feat = cls_conv(cls_x)
+            reg_feat = reg_conv(reg_x)
+            outputs["cls_output"].append(self.cls_preds[k](cls_feat))
+            outputs["reg_output"].append(self.reg_preds[k](reg_feat))
+            outputs["obj_output"].append(self.obj_preds[k](reg_feat))
+        return outputs
+
+    def forward(self, xin, labels=None, imgs=None):
+        fused_feats, image_feats = xin  # both are [BCHW] lists
+
+        # compute outputs
+        out_fused = self._forward_single(fused_feats)
+        out_image = self.image_head(image_feats)
+
+        # collect feature maps
+        fused_ret = dict(outputs=[], origin_preds=[], x_shifts=[], y_shifts=[], expanded_strides=[])
+        image_ret = dict(outputs=[], origin_preds=[], x_shifts=[], y_shifts=[], expanded_strides=[])
+
+        for k in range(self.num_scales):
+            self.collect_outputs(out_fused["cls_output"][k], out_fused["reg_output"][k], out_fused["obj_output"][k], k, self.strides[k], ret=fused_ret)
+            self.collect_outputs(out_image["cls_output"][k], out_image["reg_output"][k], out_image["obj_output"][k], k, self.strides[k], ret=image_ret)
+
+        if self.training:
+            # Expect labels to be (labels_fused, labels_image)
+            if isinstance(labels, tuple) and len(labels) == 2:
+                labels_fused, labels_image = labels
+            else:
+                labels_fused, labels_image = labels, labels
+
+            losses_image = self.get_losses(
+                imgs,
+                image_ret['x_shifts'],
+                image_ret['y_shifts'],
+                image_ret['expanded_strides'],
+                labels_image,
+                torch.cat(image_ret['outputs'], 1),
+                image_ret['origin_preds'],
+                dtype=image_ret['x_shifts'][0].dtype,
+            )
+
+            losses_fused = self.get_losses(
+                imgs,
+                fused_ret['x_shifts'],
+                fused_ret['y_shifts'],
+                fused_ret['expanded_strides'],
+                labels_fused,
+                torch.cat(fused_ret['outputs'], 1),
+                fused_ret['origin_preds'],
+                dtype=fused_feats[0].dtype,
+            )
+
+            # sum losses element-wise
+            losses_image = list(losses_image)
+            losses_fused = list(losses_fused)
+            for i in range(len(losses_image)):
+                losses_image[i] = losses_image[i] + losses_fused[i]
+            return losses_image
+
+        # eval: use fused outputs
+        out = fused_ret['outputs']
+        self.hw = [x.shape[-2:] for x in out]
+        outputs = torch.cat([x.flatten(start_dim=2) for x in out], dim=2).permute(0, 2, 1)
+        return self.decode_outputs(outputs, dtype=out[0].type())
 
 class GNNHead(YOLOXHead):
     def __init__(

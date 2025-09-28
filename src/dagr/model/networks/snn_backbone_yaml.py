@@ -36,4 +36,14 @@ class SNNBackboneYAMLWrapper(nn.Module):
         p5_bchw = p5.mean(dim=0)
         return [p4_bchw, p5_bchw]
 
+    def forward_time(self, data, reset: bool = True):
+        """
+        Return multi-scale features with temporal dimension preserved.
+        Output: dict with keys 'p4','p5' and values [T,B,C,H,W].
+        """
+        setattr(data, 'meta_height', self.height)
+        setattr(data, 'meta_width', self.width)
+        p3, p4, p5 = self.backbone(data)
+        return {"p4": p4, "p5": p5}
+
 
