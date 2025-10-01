@@ -16,21 +16,22 @@ class SpikeCAFR(nn.Module):
       - fused rgb-like feature: [B,C_out,H,W]
     """
 
-    def __init__(self, in_channels: int, out_channels: int, num_heads: int = 8):
+    def __init__(self, rgb_in_channels: int, evt_in_channels: int, out_channels: int, num_heads: int = 8):
         super().__init__()
-        self.in_channels = in_channels
+        self.rgb_in_channels = rgb_in_channels
+        self.evt_in_channels = evt_in_channels
         self.out_channels = out_channels
 
-        self.conv_rgb_in = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0, bias=False)
-        self.bn_rgb_in = nn.BatchNorm2d(in_channels)
+        self.conv_rgb_in = nn.Conv2d(rgb_in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_rgb_in = nn.BatchNorm2d(out_channels)
 
-        self.conv_evt_in = nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0, bias=False)
-        self.bn_evt_in = nn.BatchNorm2d(in_channels)
+        self.conv_evt_in = nn.Conv2d(evt_in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn_evt_in = nn.BatchNorm2d(out_channels)
 
-        self.rgb_centric_attn = CrossAttention(embed_dims=in_channels, num_heads=num_heads)
-        self.evt_centric_attn = CrossAttention(embed_dims=in_channels, num_heads=num_heads)
+        self.rgb_centric_attn = CrossAttention(embed_dims=out_channels, num_heads=num_heads)
+        self.evt_centric_attn = CrossAttention(embed_dims=out_channels, num_heads=num_heads)
 
-        self.conv_out = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.conv_out = nn.Conv2d(out_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_out = nn.BatchNorm2d(out_channels)
 
     @staticmethod
@@ -56,10 +57,10 @@ class SpikeCAFR(nn.Module):
         return x
 
     def forward(self, rgb: torch.Tensor, evt: torch.Tensor) -> torch.Tensor:
-        # pre-project
+        # 预投射
         rgb = self.bn_rgb_in(self.conv_rgb_in(rgb))
-        T, B, C, H, W = evt.shape
-        evt = self.bn_evt_in(self.conv_evt_in(evt.flatten(0, 1))).view(T, B, C, H, W)
+        T, B, C_evt, H, W = evt.shape
+        evt = self.bn_evt_in(self.conv_evt_in(evt.flatten(0, 1))).view(T, B, self.out_channels, H, W)
 
         # element-wise interaction (REFusion-like)
         evt_mean = evt.mean(dim=0)  # [B,C,H,W]
@@ -68,14 +69,14 @@ class SpikeCAFR(nn.Module):
         evt_enh = evt + mul.unsqueeze(0)
 
         # spike-driven bidirectional cross-attention
-        q_rgb = self._bchw_to_tbnc(rgb_enh)
-        kv_evt = self._tbchw_to_tbnc(evt_enh)
-        out_rgb = self.rgb_centric_attn(q_rgb, kv_evt, kv_evt)  # [T,B,N,C]
+        q_rgb = self._bchw_to_tbnc(rgb_enh)   # [1,B,N,C]
+        kv_evt = self._tbchw_to_tbnc(evt_enh) # [T,B,N,C]
+        out_rgb = self.rgb_centric_attn(q_rgb, kv_evt, kv_evt)  # [T,B,N,C] (T aligned inside)
         out_rgb = self._tbnc_to_bchw(out_rgb, H, W)
 
-        q_evt = kv_evt
-        kv_rgb = self._bchw_to_tbnc(rgb_enh)
-        out_evt = self.evt_centric_attn(q_evt, kv_rgb.expand_as(q_evt), kv_rgb.expand_as(q_evt))  # [T,B,N,C]
+        q_evt = kv_evt                              # [T,B,N,C]
+        kv_rgb = self._bchw_to_tbnc(rgb_enh)        # [1,B,N,C]
+        out_evt = self.evt_centric_attn(q_evt, kv_rgb, kv_rgb)  # [T,B,N,C] (T aligned inside)
         out_evt = self._tbnc_to_bchw(out_evt, H, W)
 
         fused = out_rgb + out_evt

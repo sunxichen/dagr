@@ -112,18 +112,48 @@ class HookModule(torch.nn.Module):
         self.outputs = []
         features_hook = lambda m, i, o: self.features.append(o)
         outputs_hook = lambda m, i, o: self.outputs.append(o)
+        # defensive: ensure module has the layers and attach hook to the last submodule if needed
         for l in self.feature_layers:
-            hook_id = self.extract_layer(self.module, l.split(".")).register_forward_hook(features_hook)
-            self.hooks.append(hook_id)
+            try:
+                target = self.extract_layer(self.module, l.split("."))
+                # if target is Sequential, hook its last child
+                if hasattr(target, "_modules") and len(target._modules) > 0:
+                    last = list(target._modules.values())[-1]
+                    target = last
+                hook_id = target.register_forward_hook(features_hook)
+                self.hooks.append(hook_id)
+            except Exception as e:
+                print(f"[HookDebug][WARN] feature hook '{l}' failed: {repr(e)}")
         for l in self.output_layers:
-            hook_id = self.extract_layer(self.module, l.split(".")).register_forward_hook(outputs_hook)
-            self.hooks.append(hook_id)
+            try:
+                target = self.extract_layer(self.module, l.split("."))
+                if hasattr(target, "_modules") and len(target._modules) > 0:
+                    last = list(target._modules.values())[-1]
+                    target = last
+                hook_id = target.register_forward_hook(outputs_hook)
+                self.hooks.append(hook_id)
+            except Exception as e:
+                print(f"[HookDebug][WARN] output hook '{l}' failed: {repr(e)}")
 
     def forward(self, x):
+        # debug: basic device/type info
+        try:
+            print(f"[HookDebug] module_device={next(self.module.parameters()).device}, x_device={x.device}, x_shape={tuple(x.shape)}")
+        except Exception as e:
+            print(f"[HookDebug] device info unavailable: {repr(e)}")
+
+        # re-register hooks to ensure they are attached to the current (possibly moved) module
+        try:
+            self.remove_hooks()
+            self.register_hooks()
+        except Exception as e:
+            print(f"[HookDebug][WARN] re-register hooks failed: {repr(e)}")
+
         self.features = []
         self.outputs = []
         self.module(x)
 
+        print(f"[HookDebug] after forward: features={len(self.features)}, outputs={len(self.outputs)}")
         features = self.features
         if len(self.feature_dconv) > 0:
             features = [dconv(f) for f, dconv in zip(self.features, self.feature_dconv)]
@@ -131,5 +161,13 @@ class HookModule(torch.nn.Module):
         outputs = self.outputs
         if len(self.output_dconv) > 0:
             outputs = [dconv(o) for o, dconv in zip(self.outputs, self.output_dconv)]
+
+        if len(outputs) == 0:
+            print(f"[HookDebug][WARN] outputs is empty. feature_layers={self.feature_layers} output_layers={self.output_layers}")
+            for i, f in enumerate(features):
+                try:
+                    print(f"[HookDebug] features[{i}] shape={tuple(f.shape)}")
+                except Exception as e:
+                    print(f"[HookDebug] features[{i}] shape unavailable: {repr(e)}")
 
         return features, outputs

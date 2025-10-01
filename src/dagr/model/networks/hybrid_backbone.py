@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 
-from dagr.model.networks.net_img import HookModule
-from torchvision.models import resnet18, resnet34, resnet50
+from dagr.model.networks.net import Net
 from dagr.model.networks.snn_backbone_yaml import SNNBackboneYAMLWrapper
 from dagr.model.layers.fusion import SpikeCAFR
 
@@ -22,28 +21,33 @@ class HybridBackbone(nn.Module):
         self.height = int(height)
         self.width = int(width)
 
-        # RGB backbone (pretrained ResNet via HookModule)
-        img_net = eval(args.img_net)
-        self.rgb = HookModule(img_net(pretrained=True),
-                              input_channels=3,
-                              height=height, width=width,
-                              feature_layers=["layer2", "layer3", "layer4"],
-                              output_layers=["layer3", "layer4"],
-                              feature_channels=None,
-                              output_channels=[256, 512])
+        # RGB backbone using existing Net; will run image path and expose 4 stages
+        args_local = args
+        args_local.use_image = True
+        self.rgb = Net(args_local, height=height, width=width)
 
         # SNN backbone (temporal features)
         yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
         scale = getattr(args, 'snn_scale', 's')
         self.snn = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
 
-        # fusion blocks aligned to output_layers: we fuse at two stages (stride 16, 32)
-        self.fuse_p4 = SpikeCAFR(in_channels=256, out_channels=256)
-        self.fuse_p5 = SpikeCAFR(in_channels=512, out_channels=512)
+        # derive channel dimensions from HookModule inside Net
+        feat_ch = list(self.rgb.net.feature_channels)  # [conv1, l1, l2, l3, l4]
+        out_ch = list(self.rgb.net.output_channels)    # [l3_proj, l4_proj]
 
-        self.out_channels = [256, 512]
-        self.strides = [16, 32]
-        self.num_scales = 2
+        c2_ch = feat_ch[1] if len(feat_ch) > 1 else 64
+        c3_ch = feat_ch[2] if len(feat_ch) > 2 else 128
+        c4_ch = out_ch[0] if len(out_ch) > 0 else 256
+        c5_ch = out_ch[1] if len(out_ch) > 1 else 512
+
+        self.fuse_p2 = SpikeCAFR(rgb_in_channels=c2_ch, evt_in_channels=64, out_channels=c2_ch)
+        self.fuse_p3 = SpikeCAFR(rgb_in_channels=c3_ch, evt_in_channels=128, out_channels=c3_ch)
+        self.fuse_p4 = SpikeCAFR(rgb_in_channels=c4_ch, evt_in_channels=256, out_channels=c4_ch)
+        self.fuse_p5 = SpikeCAFR(rgb_in_channels=c5_ch, evt_in_channels=512, out_channels=c5_ch)
+
+        self.out_channels = [c2_ch, c3_ch, c4_ch, c5_ch]
+        self.strides = [4, 8, 16, 32]
+        self.num_scales = 4
         self.num_classes = self.snn.num_classes
         self.use_image = True
 
@@ -54,20 +58,59 @@ class HybridBackbone(nn.Module):
         return sizes
 
     def forward(self, data):
-        # RGB features
-        rgb_feats, rgb_outs = self.rgb(data.image)
-        # rgb_outs correspond to [C4,C5] with channels [256,512]
+        # RGB features from Net with image enabled: get two outputs [out3,out4]; we derive four by tapping internal layers
+        # Here we require Net to return graph outputs; however for image path we repurpose image outputs
+        try:
+            print(f"[HybridDebug] rgb_module={self.rgb.net.module.__class__.__name__} feature_layers={self.rgb.net.feature_layers} output_layers={self.rgb.net.output_layers}")
+        except Exception as e:
+            print(f"[HybridDebug] rgb_module/info unavailable: {repr(e)}")
+        try:
+            print(f"[HybridDebug] image: shape={tuple(data.image.shape)}, dtype={data.image.dtype}, device={data.image.device}")
+        except Exception as e:
+            print(f"[HybridDebug] image: unavailable ({repr(e)})")
+
+        features, image_outs = self.rgb.net(data.image)
+        print(f"[HybridDebug] HookModule -> features={len(features)}, outputs={len(image_outs)}")
+        for i, f in enumerate(features):
+            try:
+                print(f"[HybridDebug] features[{i}]: {tuple(f.shape)}")
+            except Exception as e:
+                print(f"[HybridDebug] features[{i}]: shape unavailable ({repr(e)})")
+        for i, o in enumerate(image_outs):
+            try:
+                print(f"[HybridDebug] outputs[{i}]: {tuple(o.shape)}")
+            except Exception as e:
+                print(f"[HybridDebug] outputs[{i}]: shape unavailable ({repr(e)})")
+        if len(image_outs) < 2:
+            print("[HybridDebug][WARN] image_outs fewer than 2 items; check output_layers and img_net")
+        # image_outs are [layer3, layer4] projected to [256,512]
+        # To obtain c2 (64) and c3 (128), we use features from HookModule inside Net
+        # features correspond to [conv1, layer1, layer2, layer3, layer4]
+        rgb_c2 = features[1] if len(features) > 1 else None
+        rgb_c3 = features[2] if len(features) > 2 else None
+        rgb_c4 = image_outs[0]
+        rgb_c5 = image_outs[1]
 
         # SNN temporal features
         snn_feats = self.snn.forward_time(data)
-        p4_t = snn_feats["p4"]  # [T,B,256,H/16,W/16]
-        p5_t = snn_feats["p5"]  # [T,B,512,H/32,W/32]
+        print(f"[HybridDebug] snn taps: {list(snn_feats.keys())}")
+        for k, v in snn_feats.items():
+            try:
+                print(f"[HybridDebug] snn[{k}] shape={tuple(v.shape)}")
+            except Exception as e:
+                print(f"[HybridDebug] snn[{k}] shape unavailable ({repr(e)})")
+        p2_t = snn_feats.get("p2")
+        p3_t = snn_feats.get("p3")
+        p4_t = snn_feats.get("p4")
+        p5_t = snn_feats.get("p5")
 
-        # Fuse at two stages, following REFusion-like progressive design
-        fused_p4 = self.fuse_p4(rgb_outs[0], p4_t)
-        fused_p5 = self.fuse_p5(rgb_outs[1], p5_t)
+        fused_p2 = self.fuse_p2(rgb_c2, p2_t) if (rgb_c2 is not None and p2_t is not None) else None
+        fused_p3 = self.fuse_p3(rgb_c3, p3_t) if (rgb_c3 is not None and p3_t is not None) else None
+        fused_p4 = self.fuse_p4(rgb_c4, p4_t) if (rgb_c4 is not None and p4_t is not None) else None
+        fused_p5 = self.fuse_p5(rgb_c5, p5_t) if (rgb_c5 is not None and p5_t is not None) else None
 
-        # return fused and image-only features for dual supervision in HybridHead
-        return [fused_p4, fused_p5], [rgb_outs[0], rgb_outs[1]]
+        fused = [x for x in [fused_p2, fused_p3, fused_p4, fused_p5] if x is not None]
+        rgb_only = [x for x in [rgb_c2, rgb_c3, rgb_c4, rgb_c5] if x is not None]
+        return fused, rgb_only
 
 

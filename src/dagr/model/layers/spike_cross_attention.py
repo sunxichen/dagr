@@ -65,13 +65,12 @@ class CrossAttention(nn.Module):
         T, B, N, C = x.shape
         x = x.permute(0, 1, 3, 2).contiguous()  # T,B,C,N
         x = proj(x.flatten(0, 1)).reshape(T, B, C, N)
-        # spike nonlinearity in spike domain
         x = spike(x)
         x = x.permute(0, 1, 3, 2).contiguous()  # T,B,N,C
         return x
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        # normalize shapes: allow query T=1 (unsqueeze if needed)
+
         if query.dim() == 4 and key.dim() == 4 and value.dim() == 4:
             pass
         else:
@@ -81,6 +80,17 @@ class CrossAttention(nn.Module):
         Tk, Bk, NK, Ck = key.shape
         Tv, Bv, NV, Cv = value.shape
         assert B == Bk == Bv and C == Ck == Cv and NK == NV and Tk == Tv
+
+        # align temporal dimensions: if only one of (query,key/value) has T>1, repeat along T
+        if Tq != Tk:
+            if Tq == 1 and Tk > 1:
+                query = query.expand(Tk, -1, -1, -1)
+                Tq = Tk
+            elif Tk == 1 and Tq > 1:
+                key = key.expand(Tq, -1, -1, -1)
+                value = value.expand(Tq, -1, -1, -1)
+                Tk = Tq
+        T = max(Tq, Tk)
 
         # linear projections with spike
         q = self._project_tokens(query, self.q_proj)
@@ -104,7 +114,7 @@ class CrossAttention(nn.Module):
         out = torch.matmul(attn, vh)  # [T,B,H,NQ,D]
 
         # merge heads
-        out = out.permute(0, 1, 3, 2, 4).contiguous().view(Tq, B, NQ, C)
+        out = out.permute(0, 1, 3, 2, 4).contiguous().view(T, B, NQ, C)
 
         # output projection
         out = out.permute(0, 1, 3, 2).contiguous()  # T,B,C,N

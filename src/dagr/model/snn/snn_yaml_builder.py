@@ -97,8 +97,8 @@ def parse_model(d: dict, ch: int, scale: str = 's', verbose: bool = False, heigh
         # track output channels correctly per module
         ch_list.append(c_out)
 
-        # tap indices for P3/P4/P5 based on YAML order (indices 4,6,9 after parse)
-        if i in (4, 6, 9):
+        # tap indices for P2/P3/P4/P5 based on YAML order (indices 2,4,6,9 after parse)
+        if i in (2, 4, 6, 9):
             tap_indices.append(i)
 
     return nn.Sequential(*layers), sorted(set(save)), tap_indices
@@ -124,10 +124,12 @@ class YAMLBackbone(nn.Module):
             y.append(x)
             if m.i in self.tap_indices:
                 taps[m.i] = x
-        # Order taps by indices: expect [4,6,9]
-        p3 = taps.get(self.tap_indices[0])
-        p4 = taps.get(self.tap_indices[1])
-        p5 = taps.get(self.tap_indices[2])
-        return [p3, p4, p5]
+        # Order taps by indices: expect [2,4,6,9]
+        # Guard against missing taps in unusual YAMLs
+        p2 = taps.get(self.tap_indices[0]) if len(self.tap_indices) > 0 else None
+        p3 = taps.get(self.tap_indices[1]) if len(self.tap_indices) > 1 else None
+        p4 = taps.get(self.tap_indices[2]) if len(self.tap_indices) > 2 else None
+        p5 = taps.get(self.tap_indices[3]) if len(self.tap_indices) > 3 else None
+        return [p2, p3, p4, p5]
 
 

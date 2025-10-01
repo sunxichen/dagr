@@ -30,12 +30,16 @@ class DAGR(YOLOX):
         use_snn = hasattr(args, 'use_snn_backbone') and getattr(args, 'use_snn_backbone') and SNNBackboneYAMLWrapper is not None
         print(f"Debug: use_snn: {use_snn}")
 
+        use_image = hasattr(args, 'use_image') and getattr(args, 'use_image')
+        print(f"Debug: use_image: {use_image}")
+
         if use_snn and getattr(args, 'use_image', False) and HybridBackbone is not None:
+            print(f"Debug: running with hybrid backbone")
             backbone = HybridBackbone(args, height=height, width=width)
             head = HybridHead(num_classes=backbone.num_classes,
-                             strides=backbone.strides,
-                             in_channels=backbone.out_channels,
-                             args=args)
+                               strides=backbone.strides,
+                               in_channels=backbone.out_channels,
+                               args=args)
         elif use_snn:
             yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
             scale = getattr(args, 'snn_scale', 's')
@@ -132,6 +136,9 @@ class DAGR(YOLOX):
 
 
 class CNNHead(YOLOXHead):
+    def __init__(self, num_classes, width=1.0, strides=[8, 16, 32], in_channels=[256, 512, 1024], act="silu", depthwise=False):
+        super().__init__(num_classes, width, strides, in_channels, act, depthwise)
+    
     def forward(self, xin):
         outputs = dict(cls_output=[], reg_output=[], obj_output=[])
 
@@ -152,11 +159,12 @@ class CNNHead(YOLOXHead):
 
 class HybridHead(YOLOXHead):
     def __init__(self, num_classes, strides=[16, 32], in_channels=[256, 512], act="silu", depthwise=False, args=None):
-        YOLOXHead.__init__(self, num_classes, args.yolo_stem_width, strides, in_channels, act, depthwise)
+        # Use width=1.0 to match fused feature channels exactly, not scaled by yolo_stem_width
+        YOLOXHead.__init__(self, num_classes, 1.0, strides, in_channels, act, depthwise)
         self.strides = strides
         self.num_scales = len(in_channels)
         # Image-only head for auxiliary supervision
-        self.image_head = CNNHead(num_classes=num_classes, strides=strides, in_channels=in_channels)
+        self.image_head = CNNHead(num_classes=num_classes, width=1.0, strides=strides, in_channels=in_channels, act=act, depthwise=depthwise)
 
     def _forward_single(self, xin):
         outputs = dict(cls_output=[], reg_output=[], obj_output=[])
@@ -170,6 +178,24 @@ class HybridHead(YOLOXHead):
             outputs["reg_output"].append(self.reg_preds[k](reg_feat))
             outputs["obj_output"].append(self.obj_preds[k](reg_feat))
         return outputs
+    
+    def _collect_outputs(self, cls_output, reg_output, obj_output, k, stride, ret):
+        """Helper method to collect outputs for loss computation"""
+        output = torch.cat([reg_output, obj_output, cls_output], 1)
+        ret["outputs"].append(output)
+        ret["origin_preds"].append(torch.cat([reg_output, obj_output, cls_output], 1))
+        
+        # Generate grid
+        batch_size = cls_output.shape[0]
+        hsize, wsize = cls_output.shape[-2:]
+        
+        yv, xv = torch.meshgrid([torch.arange(hsize), torch.arange(wsize)], indexing='ij')
+        grid = torch.stack((xv, yv), 2).view(1, 1, hsize, wsize, 2).type_as(cls_output)
+        grid = grid.view(1, -1, 2)
+        
+        ret["x_shifts"].append(grid[..., 0])
+        ret["y_shifts"].append(grid[..., 1])
+        ret["expanded_strides"].append(torch.full((1, grid.shape[1]), stride, dtype=cls_output.dtype, device=cls_output.device))
 
     def forward(self, xin, labels=None, imgs=None):
         fused_feats, image_feats = xin  # both are [BCHW] lists
@@ -183,8 +209,8 @@ class HybridHead(YOLOXHead):
         image_ret = dict(outputs=[], origin_preds=[], x_shifts=[], y_shifts=[], expanded_strides=[])
 
         for k in range(self.num_scales):
-            self.collect_outputs(out_fused["cls_output"][k], out_fused["reg_output"][k], out_fused["obj_output"][k], k, self.strides[k], ret=fused_ret)
-            self.collect_outputs(out_image["cls_output"][k], out_image["reg_output"][k], out_image["obj_output"][k], k, self.strides[k], ret=image_ret)
+            self._collect_outputs(out_fused["cls_output"][k], out_fused["reg_output"][k], out_fused["obj_output"][k], k, self.strides[k], ret=fused_ret)
+            self._collect_outputs(out_image["cls_output"][k], out_image["reg_output"][k], out_image["obj_output"][k], k, self.strides[k], ret=image_ret)
 
         if self.training:
             # Expect labels to be (labels_fused, labels_image)
