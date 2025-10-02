@@ -8,9 +8,12 @@ set -euo pipefail
 # export CUDA_VISIBLE_DEVICES=0
 
 export WANDB_MODE=disabled
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+export DISTRIBUTED=1
 
 # Paths
 PYTHON=python
+TORCHRUN=torchrun
 TRAIN_SCRIPT=scripts/train_dsec.py
 
 # Output
@@ -43,23 +46,56 @@ mkdir -p "$OUTPUT_DIR"
 echo "Training log will be saved to: $LOG_FILE"
 echo "Starting training..."
 
-$PYTHON "$TRAIN_SCRIPT" \
-  --config config/dagr-s-dsec.yaml \
-  --dataset "$DATASET" \
-  --output_directory "$OUTPUT_DIR" \
-  --exp_name "$EXP_NAME" \
-  --batch_size "$BATCH_SIZE" \
-  --tot_num_epochs "$EPOCHS" \
-  --l_r "$LR" \
-  --weight_decay "$WEIGHT_DECAY" \
-  --exp_trend "$EXP_TREND" \
-  --use_snn_backbone \
-  --use_image \
-  --snn_yaml_path "$SNN_YAML" \
-  --snn_scale "$SNN_SCALE" \
-  --snn_temporal_bins "$SNN_TEMPORAL_BINS" \
-  --dataset_directory "$DATASET_DIR" \
-  2>&1 | tee "$LOG_FILE"
+# If DISTRIBUTED=1, run with torchrun and enable --distributed
+if [[ "${DISTRIBUTED:-0}" -eq 1 ]]; then
+  # Infer NUM_GPUS from CUDA_VISIBLE_DEVICES if not provided
+  if [[ -z "${NUM_GPUS:-}" ]]; then
+    if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+      IFS=',' read -r -a DEV_ARR <<< "$CUDA_VISIBLE_DEVICES"
+      NUM_GPUS=${#DEV_ARR[@]}
+    else
+      NUM_GPUS=1
+    fi
+  fi
+  $TORCHRUN --nproc_per_node="$NUM_GPUS" "$TRAIN_SCRIPT" \
+    --distributed \
+    --config config/dagr-s-dsec.yaml \
+    --dataset "$DATASET" \
+    --output_directory "$OUTPUT_DIR" \
+    --exp_name "$EXP_NAME" \
+    --batch_size "$BATCH_SIZE" \
+    --tot_num_epochs "$EPOCHS" \
+    --l_r "$LR" \
+    --weight_decay "$WEIGHT_DECAY" \
+    --exp_trend "$EXP_TREND" \
+    --use_snn_backbone \
+    --use_image \
+    --snn_yaml_path "$SNN_YAML" \
+    --snn_scale "$SNN_SCALE" \
+    --snn_temporal_bins "$SNN_TEMPORAL_BINS" \
+    --dataset_directory "$DATASET_DIR" \
+    --debug_unused_params \
+    --print_param_index_map \
+    2>&1 | tee "$LOG_FILE"
+else
+  $PYTHON "$TRAIN_SCRIPT" \
+    --config config/dagr-s-dsec.yaml \
+    --dataset "$DATASET" \
+    --output_directory "$OUTPUT_DIR" \
+    --exp_name "$EXP_NAME" \
+    --batch_size "$BATCH_SIZE" \
+    --tot_num_epochs "$EPOCHS" \
+    --l_r "$LR" \
+    --weight_decay "$WEIGHT_DECAY" \
+    --exp_trend "$EXP_TREND" \
+    --use_snn_backbone \
+    --use_image \
+    --snn_yaml_path "$SNN_YAML" \
+    --snn_scale "$SNN_SCALE" \
+    --snn_temporal_bins "$SNN_TEMPORAL_BINS" \
+    --dataset_directory "$DATASET_DIR" \
+    2>&1 | tee "$LOG_FILE"
+fi
 
 # If your FLAGS require --dataset_directory, add: \
 #   --dataset_directory /absolute/path/to/datasets

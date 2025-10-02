@@ -17,6 +17,7 @@ def BASE_FLAGS():
     parser.add_argument("--no_events", action="store_true")
     parser.add_argument("--pretrain_cnn", action="store_true")
     parser.add_argument("--keep_temporal_ordering", action="store_true")
+    parser.add_argument("--debug_unused_params", action="store_true", help="Print parameters that did not receive gradients after backward() on the first iteration")
 
     # task params
     parser.add_argument("--task", default=argparse.SUPPRESS, type=str)
@@ -67,6 +68,9 @@ def FLAGS():
     parser.add_argument('--l_r', default=argparse.SUPPRESS, type=float)
     parser.add_argument('--no_eval', action="store_true")
     parser.add_argument('--tot_num_epochs', default=argparse.SUPPRESS, type=int)
+    # distributed training switch (torchrun + DDP)
+    parser.add_argument('--distributed', action="store_true")
+    parser.add_argument('--print_param_index_map', action='store_true', help='Print an index->name map of model parameters on rank0 after model build')
 
     parser.add_argument('--run_test', action="store_true")
 
