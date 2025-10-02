@@ -84,25 +84,25 @@ def train(loader: DataLoader,
         loss.backward()
 
         # Debug: list parameters without gradients
-        if (not printed_unused_once) and getattr(args, 'debug_unused_params', False) and getattr(args, 'is_main_process', True):
-            try:
-                # unwrap ddp if needed
-                model_for_debug = model.module if hasattr(model, 'module') else model
-                unused = []
-                for idx, (name, p) in enumerate(model_for_debug.named_parameters()):
-                    if p.requires_grad and (p.grad is None):
-                        unused.append((idx, name, tuple(p.shape)))
-                if len(unused) == 0:
-                    print("[UnusedParamDebug] All parameters received gradients in this iteration.")
-                else:
-                    print("[UnusedParamDebug] Parameters without gradient (index, name, shape):")
-                    for idx, name, shape in unused[:256]:  # cap print length
-                        print(f"  {idx}: {name} {shape}")
-                    if len(unused) > 256:
-                        print(f"  ... and {len(unused) - 256} more")
-                printed_unused_once = True
-            except Exception as e:
-                print(f"[UnusedParamDebug][WARN] failed to enumerate unused params: {repr(e)}")
+        # if (not printed_unused_once) and getattr(args, 'debug_unused_params', False) and getattr(args, 'is_main_process', True):
+        #     try:
+        #         # unwrap ddp if needed
+        #         model_for_debug = model.module if hasattr(model, 'module') else model
+        #         unused = []
+        #         for idx, (name, p) in enumerate(model_for_debug.named_parameters()):
+        #             if p.requires_grad and (p.grad is None):
+        #                 unused.append((idx, name, tuple(p.shape)))
+        #         if len(unused) == 0:
+        #             print("[UnusedParamDebug] All parameters received gradients in this iteration.")
+        #         else:
+        #             print("[UnusedParamDebug] Parameters without gradient (index, name, shape):")
+        #             for idx, name, shape in unused[:256]:  # cap print length
+        #                 print(f"  {idx}: {name} {shape}")
+        #             if len(unused) > 256:
+        #                 print(f"  ... and {len(unused) - 256} more")
+        #         printed_unused_once = True
+        #     except Exception as e:
+        #         print(f"[UnusedParamDebug][WARN] failed to enumerate unused params: {repr(e)}")
 
         step_in_accum += 1
         if step_in_accum == accum_steps:
@@ -247,12 +247,12 @@ if __name__ == '__main__':
         else:
             test_dataset_fast = test_dataset
 
-    # Global batch to per-device batch and accumulation
+    # Per-GPU batch semantics: args.batch_size is per-device
     world_size = world_size if args.distributed else 1
-    total_batch = int(args.batch_size)
-    per_device_batch = max(1, total_batch // world_size)
-    accum_steps = int(math.ceil(total_batch / (per_device_batch * world_size)))
-    args.accum_steps = accum_steps
+    per_device_batch = int(args.batch_size)
+    total_batch = per_device_batch * world_size
+    accum_steps = getattr(args, 'accum_steps', 1)
+    args.accum_steps = int(accum_steps)
 
     if args.distributed:
         from torch.utils.data.distributed import DistributedSampler
@@ -278,13 +278,13 @@ if __name__ == '__main__':
     num_params = sum([np.prod(p.size()) for p in model.parameters()])
     print(f"Training with {num_params} number of parameters.")
 
-    # Optional: print index->name map to correlate with DDP error indices
-    if getattr(args, 'print_param_index_map', False):
-        try:
-            for idx, (name, p) in enumerate(model.named_parameters()):
-                print(f"[ParamIndexMap] {idx}: {name} {tuple(p.shape)}")
-        except Exception as e:
-            print(f"[ParamIndexMap][WARN] failed: {repr(e)}")
+    # print index->name map to correlate with DDP error indices
+    # if getattr(args, 'print_param_index_map', False):
+    #     try:
+    #         for idx, (name, p) in enumerate(model.named_parameters()):
+    #             print(f"[ParamIndexMap] {idx}: {name} {tuple(p.shape)}")
+    #     except Exception as e:
+    #         print(f"[ParamIndexMap][WARN] failed: {repr(e)}")
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -293,7 +293,7 @@ if __name__ == '__main__':
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,
+            # find_unused_parameters=True,
         )
     ema = ModelEMA(model.module if args.distributed else model)
 
@@ -321,8 +321,8 @@ if __name__ == '__main__':
         start_epoch = checkpointer.restore_checkpoint(args.resume_checkpoint, best=False)
         print(f"Resume from checkpoint at epoch {start_epoch}")
 
-    # Warmup evaluation only on main process
-    if args.is_main_process:
+    # Warmup evaluation only on main process (skip when --no_eval to avoid early OOM)
+    if args.is_main_process and not getattr(args, 'no_eval', False):
         with torch.no_grad():
             if EXP_TREND == 'full':
                 warmup_loader = test_loader_full
@@ -358,19 +358,20 @@ if __name__ == '__main__':
             # Evaluation scheduling per exp_trend (only rank0)
             with torch.no_grad():
                 if EXP_TREND == 'fast':
-                    if test_loader_fast is not None:
+                    if (not getattr(args, 'no_eval', False)) and test_loader_fast is not None:
                         mapcalc = run_test(test_loader_fast, ema.ema, dataset=args.dataset)
                         metrics = mapcalc.compute()
                         checkpointer.process(metrics, epoch)
                 elif EXP_TREND == 'mid':
-                    if (epoch % 3 == 0):
-                        mapcalc = run_test(test_loader_full, ema.ema, dataset=args.dataset)
-                    else:
-                        mapcalc = run_test(test_loader_fast, ema.ema, dataset=args.dataset)
-                    metrics = mapcalc.compute()
-                    checkpointer.process(metrics, epoch)
+                    if not getattr(args, 'no_eval', False):
+                        if (epoch % 3 == 0):
+                            mapcalc = run_test(test_loader_full, ema.ema, dataset=args.dataset)
+                        else:
+                            mapcalc = run_test(test_loader_fast, ema.ema, dataset=args.dataset)
+                        metrics = mapcalc.compute()
+                        checkpointer.process(metrics, epoch)
                 elif EXP_TREND == 'full':
-                    if (epoch % 3 == 0):
+                    if (not getattr(args, 'no_eval', False)) and (epoch % 3 == 0):
                         mapcalc = run_test(test_loader_full, ema.ema, dataset=args.dataset)
                         metrics = mapcalc.compute()
                         checkpointer.process(metrics, epoch)

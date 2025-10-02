@@ -118,6 +118,7 @@ def parse_config(args: argparse.ArgumentParser, config: Path):
     with config.open() as f:
         config = yaml.load(f, Loader=yaml.SafeLoader)
         for k, v in config.items():
-            if k not in args:
+            # Prefer command-line flags over YAML. Only set values not provided via CLI.
+            if not hasattr(args, k):
                 setattr(args, k, v)
         return args

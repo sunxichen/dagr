@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from dagr.model.networks.net import Net
+from dagr.model.networks.image_backbone import ImageBackbone
 from dagr.model.networks.snn_backbone_yaml import SNNBackboneYAMLWrapper
 from dagr.model.layers.fusion import SpikeCAFR
 
@@ -21,24 +21,21 @@ class HybridBackbone(nn.Module):
         self.height = int(height)
         self.width = int(width)
 
-        # RGB backbone using existing Net; will run image path and expose 4 stages
+        # RGB backbone using minimal ImageBackbone; will run image path and expose 4 stages
         args_local = args
         args_local.use_image = True
-        self.rgb = Net(args_local, height=height, width=width)
+        self.rgb = ImageBackbone(args_local, height=height, width=width)
 
         # SNN backbone (temporal features)
         yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
         scale = getattr(args, 'snn_scale', 's')
         self.snn = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
 
-        # derive channel dimensions from HookModule inside Net
-        feat_ch = list(self.rgb.net.feature_channels)  # [conv1, l1, l2, l3, l4]
-        out_ch = list(self.rgb.net.output_channels)    # [l3_proj, l4_proj]
-
-        c2_ch = feat_ch[1] if len(feat_ch) > 1 else 64
-        c3_ch = feat_ch[2] if len(feat_ch) > 2 else 128
-        c4_ch = out_ch[0] if len(out_ch) > 0 else 256
-        c5_ch = out_ch[1] if len(out_ch) > 1 else 512
+        # derive channel dimensions from ImageBackbone exposed specs
+        c2_ch = self.rgb.feature_channels[0]
+        c3_ch = self.rgb.feature_channels[1]
+        c4_ch = self.rgb.output_channels[0]
+        c5_ch = self.rgb.output_channels[1]
 
         self.fuse_p2 = SpikeCAFR(rgb_in_channels=c2_ch, evt_in_channels=64, out_channels=c2_ch)
         self.fuse_p3 = SpikeCAFR(rgb_in_channels=c3_ch, evt_in_channels=128, out_channels=c3_ch)
@@ -67,7 +64,7 @@ class HybridBackbone(nn.Module):
         # except Exception as e:
         #     print(f"[HybridDebug] image: unavailable ({repr(e)})")
 
-        features, image_outs = self.rgb.net(data.image)
+        features, image_outs = self.rgb(data.image)
         # print(f"[HybridDebug] HookModule -> features={len(features)}, outputs={len(image_outs)}")
         # for i, f in enumerate(features):
         #     try:
