@@ -23,7 +23,7 @@ SNN_SCALE=s
 SNN_TEMPORAL_BINS=4
 
 # Hyperparameters (default to config's baseline)
-BATCH_SIZE=16
+BATCH_SIZE=2
 EPOCHS=801
 LR=0.0002
 WEIGHT_DECAY=0.00001

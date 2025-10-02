@@ -181,6 +181,11 @@ class HybridHead(YOLOXHead):
     
     def _collect_outputs(self, cls_output, reg_output, obj_output, k, stride, ret):
         """Helper method to collect outputs for loss computation"""
+        # Ensure tensors are contiguous before concatenation
+        reg_output = reg_output.contiguous()
+        obj_output = obj_output.contiguous()
+        cls_output = cls_output.contiguous()
+        
         output = torch.cat([reg_output, obj_output, cls_output], 1)
         ret["outputs"].append(output)
         ret["origin_preds"].append(torch.cat([reg_output, obj_output, cls_output], 1))
@@ -219,13 +224,18 @@ class HybridHead(YOLOXHead):
             else:
                 labels_fused, labels_image = labels, labels
 
+            # Flatten outputs along spatial dimension before concatenating across scales
+            # Ensure contiguous tensors for proper view/reshape operations
+            image_outputs_flat = torch.cat([x.contiguous().flatten(start_dim=2) for x in image_ret['outputs']], dim=2).permute(0, 2, 1).contiguous()
+            fused_outputs_flat = torch.cat([x.contiguous().flatten(start_dim=2) for x in fused_ret['outputs']], dim=2).permute(0, 2, 1).contiguous()
+            
             losses_image = self.get_losses(
                 imgs,
                 image_ret['x_shifts'],
                 image_ret['y_shifts'],
                 image_ret['expanded_strides'],
                 labels_image,
-                torch.cat(image_ret['outputs'], 1),
+                image_outputs_flat,
                 image_ret['origin_preds'],
                 dtype=image_ret['x_shifts'][0].dtype,
             )
@@ -236,7 +246,7 @@ class HybridHead(YOLOXHead):
                 fused_ret['y_shifts'],
                 fused_ret['expanded_strides'],
                 labels_fused,
-                torch.cat(fused_ret['outputs'], 1),
+                fused_outputs_flat,
                 fused_ret['origin_preds'],
                 dtype=fused_feats[0].dtype,
             )

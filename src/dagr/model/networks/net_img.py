@@ -137,12 +137,11 @@ class HookModule(torch.nn.Module):
 
     def forward(self, x):
         # debug: basic device/type info
-        try:
-            print(f"[HookDebug] module_device={next(self.module.parameters()).device}, x_device={x.device}, x_shape={tuple(x.shape)}")
-        except Exception as e:
-            print(f"[HookDebug] device info unavailable: {repr(e)}")
+        # try:
+        #     print(f"[HookDebug] module_device={next(self.module.parameters()).device}, x_device={x.device}, x_shape={tuple(x.shape)}")
+        # except Exception as e:
+        #     print(f"[HookDebug] device info unavailable: {repr(e)}")
 
-        # re-register hooks to ensure they are attached to the current (possibly moved) module
         try:
             self.remove_hooks()
             self.register_hooks()
@@ -153,7 +152,7 @@ class HookModule(torch.nn.Module):
         self.outputs = []
         self.module(x)
 
-        print(f"[HookDebug] after forward: features={len(self.features)}, outputs={len(self.outputs)}")
+        # print(f"[HookDebug] after forward: features={len(self.features)}, outputs={len(self.outputs)}")
         features = self.features
         if len(self.feature_dconv) > 0:
             features = [dconv(f) for f, dconv in zip(self.features, self.feature_dconv)]
@@ -164,10 +163,10 @@ class HookModule(torch.nn.Module):
 
         if len(outputs) == 0:
             print(f"[HookDebug][WARN] outputs is empty. feature_layers={self.feature_layers} output_layers={self.output_layers}")
-            for i, f in enumerate(features):
-                try:
-                    print(f"[HookDebug] features[{i}] shape={tuple(f.shape)}")
-                except Exception as e:
-                    print(f"[HookDebug] features[{i}] shape unavailable: {repr(e)}")
+            # for i, f in enumerate(features):
+            #     try:
+            #         print(f"[HookDebug] features[{i}] shape={tuple(f.shape)}")
+            #     except Exception as e:
+            #         print(f"[HookDebug] features[{i}] shape unavailable: {repr(e)}")
 
         return features, outputs

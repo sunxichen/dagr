@@ -58,34 +58,30 @@ class HybridBackbone(nn.Module):
         return sizes
 
     def forward(self, data):
-        # RGB features from Net with image enabled: get two outputs [out3,out4]; we derive four by tapping internal layers
-        # Here we require Net to return graph outputs; however for image path we repurpose image outputs
-        try:
-            print(f"[HybridDebug] rgb_module={self.rgb.net.module.__class__.__name__} feature_layers={self.rgb.net.feature_layers} output_layers={self.rgb.net.output_layers}")
-        except Exception as e:
-            print(f"[HybridDebug] rgb_module/info unavailable: {repr(e)}")
-        try:
-            print(f"[HybridDebug] image: shape={tuple(data.image.shape)}, dtype={data.image.dtype}, device={data.image.device}")
-        except Exception as e:
-            print(f"[HybridDebug] image: unavailable ({repr(e)})")
+        # try:
+        #     print(f"[HybridDebug] rgb_module={self.rgb.net.module.__class__.__name__} feature_layers={self.rgb.net.feature_layers} output_layers={self.rgb.net.output_layers}")
+        # except Exception as e:
+        #     print(f"[HybridDebug] rgb_module/info unavailable: {repr(e)}")
+        # try:
+        #     print(f"[HybridDebug] image: shape={tuple(data.image.shape)}, dtype={data.image.dtype}, device={data.image.device}")
+        # except Exception as e:
+        #     print(f"[HybridDebug] image: unavailable ({repr(e)})")
 
         features, image_outs = self.rgb.net(data.image)
-        print(f"[HybridDebug] HookModule -> features={len(features)}, outputs={len(image_outs)}")
-        for i, f in enumerate(features):
-            try:
-                print(f"[HybridDebug] features[{i}]: {tuple(f.shape)}")
-            except Exception as e:
-                print(f"[HybridDebug] features[{i}]: shape unavailable ({repr(e)})")
-        for i, o in enumerate(image_outs):
-            try:
-                print(f"[HybridDebug] outputs[{i}]: {tuple(o.shape)}")
-            except Exception as e:
-                print(f"[HybridDebug] outputs[{i}]: shape unavailable ({repr(e)})")
-        if len(image_outs) < 2:
-            print("[HybridDebug][WARN] image_outs fewer than 2 items; check output_layers and img_net")
-        # image_outs are [layer3, layer4] projected to [256,512]
-        # To obtain c2 (64) and c3 (128), we use features from HookModule inside Net
-        # features correspond to [conv1, layer1, layer2, layer3, layer4]
+        # print(f"[HybridDebug] HookModule -> features={len(features)}, outputs={len(image_outs)}")
+        # for i, f in enumerate(features):
+        #     try:
+        #         print(f"[HybridDebug] features[{i}]: {tuple(f.shape)}")
+        #     except Exception as e:
+        #         print(f"[HybridDebug] features[{i}]: shape unavailable ({repr(e)})")
+        # for i, o in enumerate(image_outs):
+        #     try:
+        #         print(f"[HybridDebug] outputs[{i}]: {tuple(o.shape)}")
+        #     except Exception as e:
+        #         print(f"[HybridDebug] outputs[{i}]: shape unavailable ({repr(e)})")
+        # if len(image_outs) < 2:
+        #     print("[HybridDebug][WARN] image_outs fewer than 2 items; check output_layers and img_net")
+
         rgb_c2 = features[1] if len(features) > 1 else None
         rgb_c3 = features[2] if len(features) > 2 else None
         rgb_c4 = image_outs[0]
@@ -93,12 +89,12 @@ class HybridBackbone(nn.Module):
 
         # SNN temporal features
         snn_feats = self.snn.forward_time(data)
-        print(f"[HybridDebug] snn taps: {list(snn_feats.keys())}")
-        for k, v in snn_feats.items():
-            try:
-                print(f"[HybridDebug] snn[{k}] shape={tuple(v.shape)}")
-            except Exception as e:
-                print(f"[HybridDebug] snn[{k}] shape unavailable ({repr(e)})")
+        # print(f"[HybridDebug] snn taps: {list(snn_feats.keys())}")
+        # for k, v in snn_feats.items():
+        #     try:
+        #         print(f"[HybridDebug] snn[{k}] shape={tuple(v.shape)}")
+        #     except Exception as e:
+        #         print(f"[HybridDebug] snn[{k}] shape unavailable ({repr(e)})")
         p2_t = snn_feats.get("p2")
         p3_t = snn_feats.get("p3")
         p4_t = snn_feats.get("p4")

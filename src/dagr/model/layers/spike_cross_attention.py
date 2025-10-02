@@ -6,7 +6,7 @@ class _STEClamp01(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         ctx.save_for_backward(x)
-        return x.clamp_(0.0, 1.0)
+        return x.clamp(0.0, 1.0)  # Use non-inplace clamp
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -81,7 +81,6 @@ class CrossAttention(nn.Module):
         Tv, Bv, NV, Cv = value.shape
         assert B == Bk == Bv and C == Ck == Cv and NK == NV and Tk == Tv
 
-        # align temporal dimensions: if only one of (query,key/value) has T>1, repeat along T
         if Tq != Tk:
             if Tq == 1 and Tk > 1:
                 query = query.expand(Tk, -1, -1, -1)
@@ -92,7 +91,7 @@ class CrossAttention(nn.Module):
                 Tk = Tq
         T = max(Tq, Tk)
 
-        # linear projections with spike
+        # 线性spike投影
         q = self._project_tokens(query, self.q_proj)
         k = self._project_tokens(key, self.k_proj)
         v = self._project_tokens(value, self.v_proj)
@@ -116,7 +115,7 @@ class CrossAttention(nn.Module):
         # merge heads
         out = out.permute(0, 1, 3, 2, 4).contiguous().view(T, B, NQ, C)
 
-        # output projection
+        # output投射
         out = out.permute(0, 1, 3, 2).contiguous()  # T,B,C,N
         out = self.out_proj(out.flatten(0, 1)).reshape(Tq, B, C, NQ)
         out = out.permute(0, 1, 3, 2).contiguous()  # T,B,N,C
