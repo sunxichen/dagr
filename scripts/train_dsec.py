@@ -146,11 +146,28 @@ def run_test(loader: DataLoader,
 
     mapcalc = DetectionBuffer(height=base_dataset.height, width=base_dataset.width, classes=base_dataset.classes)
 
+    # debug flag from model head (ema.ema shares same structure)
+    debug_eval = False
+    try:
+        head = getattr(model, 'head', None)
+        debug_eval = bool(getattr(head, 'debug_eval', False))
+    except Exception:
+        debug_eval = False
+
+    det_count_per_image = []
+
     for i, data in enumerate(tqdm.tqdm(loader)):
         data = data.cuda()
         data = format_data(data)
 
         detections, targets = model(data)
+        if debug_eval:
+            try:
+                # detections is a list of dicts per image
+                for d in detections:
+                    det_count_per_image.append(int(d['boxes'].shape[0]))
+            except Exception:
+                pass
         if i % 10 == 0:
             torch.cuda.empty_cache()
 
@@ -160,6 +177,15 @@ def run_test(loader: DataLoader,
             break
 
     torch.cuda.empty_cache()
+
+    # For warmup (dry_run_steps>0), print a compact summary of detection counts
+    if debug_eval and dry_run_steps and dry_run_steps > 0 and len(det_count_per_image) > 0:
+        try:
+            import numpy as _np
+            arr = _np.array(det_count_per_image, dtype=_np.int32)
+            print(f"[EvalDebug][Warmup] detections_per_image: min={arr.min()}, mean={arr.mean():.2f}, max={arr.max()}, n={arr.size}")
+        except Exception:
+            pass
 
     return mapcalc
 
@@ -226,6 +252,8 @@ if __name__ == '__main__':
     EXP_TREND = getattr(args, 'exp_trend', 'fast')
     TRAIN_SUB_N = 5000
     VAL_SUB_N = 1000
+    # TRAIN_SUB_N = 200
+    # VAL_SUB_N = 1000
 
     use_train_subset = (EXP_TREND == 'fast')
     use_val_fast_subset = (EXP_TREND in ('fast', 'mid'))
@@ -288,14 +316,25 @@ if __name__ == '__main__':
 
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
+    # propagate debug flag to head for eval-time diagnostics (safe for both plain and DDP-wrapped models)
+    target_model = model.module if hasattr(model, 'module') else model
+    if hasattr(target_model, 'head') and hasattr(args, 'debug_eval'):
+        setattr(target_model.head, 'debug_eval', bool(args.debug_eval))
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            # find_unused_parameters=True,
+            find_unused_parameters=True,
         )
     ema = ModelEMA(model.module if args.distributed else model)
+    # also set debug flag on EMA copy used for eval
+    try:
+        ema_model = ema.ema
+        if hasattr(ema_model, 'head') and hasattr(args, 'debug_eval'):
+            setattr(ema_model.head, 'debug_eval', bool(args.debug_eval))
+    except Exception as e:
+        print(f"[EvalDebug][WARN] failed to set debug_eval on ema head: {repr(e)}")
 
     nominal_batch_size = 64
     lr = args.l_r * np.sqrt(args.batch_size) / np.sqrt(nominal_batch_size)

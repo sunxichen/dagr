@@ -59,6 +59,13 @@ class DAGR(YOLOX):
 
         super().__init__(backbone=backbone, head=head)
 
+        # propagate image loss alpha to head if provided
+        try:
+            if hasattr(args, 'hybrid_image_loss_alpha') and hasattr(self.head, '__setattr__'):
+                setattr(self.head, 'image_loss_alpha', float(getattr(args, 'hybrid_image_loss_alpha', 0.0)))
+        except Exception:
+            pass
+
         if "img_net_checkpoint" in args:
             state_dict = torch.load(args.img_net_checkpoint)
             init_subnetwork(self, state_dict['ema'], "backbone.net.", freeze=True)
@@ -123,8 +130,24 @@ class DAGR(YOLOX):
 
         outputs = YOLOX.forward(self, x)
 
+        # Optional diagnostic: before/after filtering counts
+        if hasattr(self.head, 'debug_eval') and getattr(self.head, 'debug_eval', False):
+            try:
+                det_no_filter = postprocess_network_output(outputs, self.backbone.num_classes, self.conf_threshold, self.nms_threshold, filtering=False,
+                                                           height=self.height, width=self.width)
+                total_before = sum(int(d['boxes'].shape[0]) for d in det_no_filter)
+                print(f"[EvalDebug] conf_th={self.conf_threshold}, nms_th={self.nms_threshold}, candidates_before_filter={total_before}")
+            except Exception as e:
+                print(f"[EvalDebug][WARN] stats failed: {repr(e)}")
+
         detections = postprocess_network_output(outputs, self.backbone.num_classes, self.conf_threshold, self.nms_threshold, filtering=filtering,
                                                 height=self.height, width=self.width)
+        if hasattr(self.head, 'debug_eval') and getattr(self.head, 'debug_eval', False):
+            try:
+                total_after = sum(int(d['boxes'].shape[0]) for d in detections)
+                print(f"[EvalDebug] candidates_after_filter={total_after}")
+            except Exception as e:
+                print(f"[EvalDebug][WARN] post stats failed: {repr(e)}")
 
         ret = [detections]
 
@@ -180,27 +203,35 @@ class HybridHead(YOLOXHead):
         return outputs
     
     def _collect_outputs(self, cls_output, reg_output, obj_output, k, stride, ret):
-        """Helper method to collect outputs for loss computation"""
-        # Ensure tensors are contiguous before concatenation
+        """Helper method to collect outputs; mirrors GNNHead semantics.
+        - Training: keep logits and also compute grids/strides for loss.
+        - Eval: apply sigmoid to obj/cls and only append outputs (no grids needed).
+        """
         reg_output = reg_output.contiguous()
         obj_output = obj_output.contiguous()
         cls_output = cls_output.contiguous()
-        
-        output = torch.cat([reg_output, obj_output, cls_output], 1)
-        ret["outputs"].append(output)
-        ret["origin_preds"].append(torch.cat([reg_output, obj_output, cls_output], 1))
-        
-        # Generate grid
-        batch_size = cls_output.shape[0]
-        hsize, wsize = cls_output.shape[-2:]
-        
-        yv, xv = torch.meshgrid([torch.arange(hsize), torch.arange(wsize)], indexing='ij')
-        grid = torch.stack((xv, yv), 2).view(1, 1, hsize, wsize, 2).type_as(cls_output)
-        grid = grid.view(1, -1, 2)
-        
-        ret["x_shifts"].append(grid[..., 0])
-        ret["y_shifts"].append(grid[..., 1])
-        ret["expanded_strides"].append(torch.full((1, grid.shape[1]), stride, dtype=cls_output.dtype, device=cls_output.device))
+
+        if self.training:
+            output = torch.cat([reg_output, obj_output, cls_output], 1)
+            ret["outputs"].append(output)
+            ret["origin_preds"].append(torch.cat([reg_output, obj_output, cls_output], 1))
+
+            hsize, wsize = cls_output.shape[-2:]
+            yv, xv = torch.meshgrid([torch.arange(hsize), torch.arange(wsize)], indexing='ij')
+            grid = torch.stack((xv, yv), 2).view(1, 1, hsize, wsize, 2).type_as(cls_output)
+            grid = grid.view(1, -1, 2)
+
+            ret["x_shifts"].append(grid[..., 0])
+            ret["y_shifts"].append(grid[..., 1])
+            ret["expanded_strides"].append(torch.full((1, grid.shape[1]), stride, dtype=cls_output.dtype, device=cls_output.device))
+        else:
+            # Eval path: probabilities required by decode/postprocess
+            output = torch.cat([
+                reg_output,
+                obj_output.sigmoid(),
+                cls_output.sigmoid()
+            ], 1)
+            ret["outputs"].append(output)
 
     def forward(self, xin, labels=None, imgs=None):
         fused_feats, image_feats = xin  # both are [BCHW] lists
@@ -224,10 +255,68 @@ class HybridHead(YOLOXHead):
             else:
                 labels_fused, labels_image = labels, labels
 
+            # Labels diagnostics
+            if getattr(self, 'debug_eval', False):
+                try:
+                    is_tuple = isinstance(labels, tuple)
+                    same_obj = (labels_fused is labels_image)
+                    print(f"[HybridTrainDebug][labels_detail] is_tuple={is_tuple}, same_object={same_obj}", flush=True)
+                    def _label_bbox_stats(lbl):
+                        try:
+                            # lbl shape: [B, M, 5] => [cls, cx, cy, w, h]
+                            mask = (lbl.sum(dim=2) > 0)
+                            if mask.numel() == 0 or mask.sum() == 0:
+                                return None
+                            coords = lbl[:, :, 1:5]
+                            coords = coords[mask]
+                            return dict(
+                                shape=tuple(lbl.shape),
+                                x_min=float(coords[:, 0].min().detach().cpu()), x_max=float(coords[:, 0].max().detach().cpu()),
+                                y_min=float(coords[:, 1].min().detach().cpu()), y_max=float(coords[:, 1].max().detach().cpu()),
+                                w_min=float(coords[:, 2].min().detach().cpu()), w_max=float(coords[:, 2].max().detach().cpu()),
+                                h_min=float(coords[:, 3].min().detach().cpu()), h_max=float(coords[:, 3].max().detach().cpu()),
+                                count=int(coords.shape[0]),
+                            )
+                        except Exception:
+                            return None
+                    stats_img = _label_bbox_stats(labels_image)
+                    stats_fus = _label_bbox_stats(labels_fused)
+                    if stats_img is not None:
+                        print(
+                            f"[HybridTrainDebug][labels_image] shape={stats_img['shape']}, x=[{stats_img['x_min']:.1f},{stats_img['x_max']:.1f}], y=[{stats_img['y_min']:.1f},{stats_img['y_max']:.1f}], w=[{stats_img['w_min']:.1f},{stats_img['w_max']:.1f}], h=[{stats_img['h_min']:.1f},{stats_img['h_max']:.1f}], count={stats_img['count']}",
+                            flush=True,
+                        )
+                    if stats_fus is not None:
+                        print(
+                            f"[HybridTrainDebug][labels_fused] shape={stats_fus['shape']}, x=[{stats_fus['x_min']:.1f},{stats_fus['x_max']:.1f}], y=[{stats_fus['y_min']:.1f},{stats_fus['y_max']:.1f}], w=[{stats_fus['w_min']:.1f},{stats_fus['w_max']:.1f}], h=[{stats_fus['h_min']:.1f},{stats_fus['h_max']:.1f}], count={stats_fus['count']}",
+                            flush=True,
+                        )
+                except Exception as _e_lbl:
+                    print(f"[HybridTrainDebug][labels_detail][WARN] {repr(_e_lbl)}", flush=True)
+
             # Flatten outputs along spatial dimension before concatenating across scales
             # Ensure contiguous tensors for proper view/reshape operations
             image_outputs_flat = torch.cat([x.contiguous().flatten(start_dim=2) for x in image_ret['outputs']], dim=2).permute(0, 2, 1).contiguous()
             fused_outputs_flat = torch.cat([x.contiguous().flatten(start_dim=2) for x in fused_ret['outputs']], dim=2).permute(0, 2, 1).contiguous()
+
+            # BBox prediction diagnostics before loss
+            if getattr(self, 'debug_eval', False):
+                try:
+                    def _stats(t):
+                        t = t.detach()
+                        return dict(
+                            shape=tuple(t.shape),
+                            min=float(t.min().cpu()), max=float(t.max().cpu()),
+                            mean=float(t.mean().cpu()), std=float(t.std().cpu()),
+                        )
+                    img_bbox = image_outputs_flat[..., :4].reshape(-1, 4)
+                    fus_bbox = fused_outputs_flat[..., :4].reshape(-1, 4)
+                    s_img = _stats(img_bbox)
+                    s_fus = _stats(fus_bbox)
+                    print(f"[HybridTrainDebug][image][bbox_pred] shape={s_img['shape']}, min={s_img['min']:.3f}, max={s_img['max']:.3f}, mean={s_img['mean']:.3f}, std={s_img['std']:.3f}", flush=True)
+                    print(f"[HybridTrainDebug][fused][bbox_pred] shape={s_fus['shape']}, min={s_fus['min']:.3f}, max={s_fus['max']:.3f}, mean={s_fus['mean']:.3f}, std={s_fus['std']:.3f}", flush=True)
+                except Exception as _e_bbox:
+                    print(f"[HybridTrainDebug][bbox_pred][WARN] {repr(_e_bbox)}", flush=True)
             
             losses_image = self.get_losses(
                 imgs,
@@ -251,15 +340,137 @@ class HybridHead(YOLOXHead):
                 dtype=fused_feats[0].dtype,
             )
 
-            # sum losses element-wise
-            losses_image = list(losses_image)
+            # Debug print for branch-wise losses and GT stats
+            if getattr(self, 'debug_eval', False):
+                try:
+                    # Unpack losses (each returns a 6-tuple)
+                    def _to_float(x):
+                        try:
+                            return float(x.detach().item())
+                        except Exception:
+                            try:
+                                return float(x)
+                            except Exception:
+                                return 0.0
+
+                    li = [
+                        _to_float(losses_image[0]),
+                        _to_float(losses_image[1]),
+                        _to_float(losses_image[2]),
+                        _to_float(losses_image[3]),
+                        _to_float(losses_image[4]),
+                        _to_float(losses_image[5]),
+                    ]
+                    lf = [
+                        _to_float(losses_fused[0]),
+                        _to_float(losses_fused[1]),
+                        _to_float(losses_fused[2]),
+                        _to_float(losses_fused[3]),
+                        _to_float(losses_fused[4]),
+                        _to_float(losses_fused[5]),
+                    ]
+
+                    # Count GTs per sample for each label set
+                    num_gt_img = None
+                    num_gt_fus = None
+                    try:
+                        nlabel_img = (labels_image.sum(dim=2) > 0).sum(dim=1)
+                        num_gt_img = [int(x) for x in nlabel_img.detach().cpu().tolist()]
+                    except Exception:
+                        pass
+                    try:
+                        nlabel_fus = (labels_fused.sum(dim=2) > 0).sum(dim=1)
+                        num_gt_fus = [int(x) for x in nlabel_fus.detach().cpu().tolist()]
+                    except Exception:
+                        pass
+
+                    print(
+                        f"[HybridTrainDebug][image] total={li[0]:.4f}, iou={li[1]:.4f}, obj={li[2]:.4f}, cls={li[3]:.4f}, l1={li[4]:.4f}, num_fg={li[5]:.2f}",
+                        flush=True,
+                    )
+                    print(
+                        f"[HybridTrainDebug][fused] total={lf[0]:.4f}, iou={lf[1]:.4f}, obj={lf[2]:.4f}, cls={lf[3]:.4f}, l1={lf[4]:.4f}, num_fg={lf[5]:.2f}",
+                        flush=True,
+                    )
+                    if (num_gt_img is not None) or (num_gt_fus is not None):
+                        print(
+                            f"[HybridTrainDebug][labels] image_num_gt={num_gt_img}, fused_num_gt={num_gt_fus}",
+                            flush=True,
+                        )
+                except Exception as _e:
+                    print(f"[HybridTrainDebug][WARN] failed to print debug losses: {repr(_e)}", flush=True)
+
+            # alpha = float(getattr(self, 'image_loss_alpha', 0.0))
+            # if alpha != 0.0:
+            #     losses_image = list(losses_image)
+            #     losses_fused = list(losses_fused)
+            #     for i in range(len(losses_fused)):
+            #         losses_fused[i] = losses_fused[i] + alpha * losses_image[i]
+            #     return losses_fused
+            # else:
+            #     losses_fused = list(losses_fused)
+            #     return losses_fused
             losses_fused = list(losses_fused)
-            for i in range(len(losses_image)):
-                losses_image[i] = losses_image[i] + losses_fused[i]
-            return losses_image
+            return losses_fused
 
         # eval: use fused outputs
         out = fused_ret['outputs']
+
+        # Optional debug: shapes/strides and activation ranges
+        if getattr(self, 'debug_eval', False):
+            try:
+                num_scales = len(out)
+                print(f"[HybridEvalDebug] num_scales={num_scales}, strides={self.strides}")
+                for k in range(min(num_scales, 2)):
+                    # pre-activation stats from raw heads
+                    cls_raw = out_fused["cls_output"][k]
+                    obj_raw = out_fused["obj_output"][k]
+                    cls_raw_min = float(cls_raw.min().detach().cpu()) if cls_raw.numel() > 0 else 0.0
+                    cls_raw_max = float(cls_raw.max().detach().cpu()) if cls_raw.numel() > 0 else 0.0
+                    obj_raw_min = float(obj_raw.min().detach().cpu()) if obj_raw.numel() > 0 else 0.0
+                    obj_raw_max = float(obj_raw.max().detach().cpu()) if obj_raw.numel() > 0 else 0.0
+                    # post-activation stats from collected outputs
+                    # layout: [reg4, obj1, clsC]
+                    reg_ch = 4
+                    obj_ch = 1
+                    cls_ch = out[k].shape[1] - reg_ch - obj_ch
+                    obj_act = out[k][:, reg_ch:reg_ch+obj_ch]
+                    cls_act = out[k][:, reg_ch+obj_ch:reg_ch+obj_ch+cls_ch]
+                    obj_act_min = float(obj_act.min().detach().cpu()) if obj_act.numel() > 0 else 0.0
+                    obj_act_max = float(obj_act.max().detach().cpu()) if obj_act.numel() > 0 else 0.0
+                    cls_act_min = float(cls_act.min().detach().cpu()) if cls_act.numel() > 0 else 0.0
+                    cls_act_max = float(cls_act.max().detach().cpu()) if cls_act.numel() > 0 else 0.0
+                    hsize, wsize = out[k].shape[-2:]
+                    print(f"[HybridEvalDebug][s{k}] hw=({hsize},{wsize}), stride={self.strides[k]}, obj_raw=[{obj_raw_min:.3f},{obj_raw_max:.3f}], cls_raw=[{cls_raw_min:.3f},{cls_raw_max:.3f}], obj_act=[{obj_act_min:.3f},{obj_act_max:.3f}], cls_act=[{cls_act_min:.3f},{cls_act_max:.3f}]")
+
+                # Also print image-branch activation stats for comparison
+                try:
+                    img_out_list = image_ret['outputs']
+                    num_scales_img = len(img_out_list)
+                    for k in range(min(num_scales_img, 2)):
+                        cls_raw_i = out_image["cls_output"][k]
+                        obj_raw_i = out_image["obj_output"][k]
+                        cls_raw_min_i = float(cls_raw_i.min().detach().cpu()) if cls_raw_i.numel() > 0 else 0.0
+                        cls_raw_max_i = float(cls_raw_i.max().detach().cpu()) if cls_raw_i.numel() > 0 else 0.0
+                        obj_raw_min_i = float(obj_raw_i.min().detach().cpu()) if obj_raw_i.numel() > 0 else 0.0
+                        obj_raw_max_i = float(obj_raw_i.max().detach().cpu()) if obj_raw_i.numel() > 0 else 0.0
+
+                        reg_ch = 4
+                        obj_ch = 1
+                        cls_ch_i = img_out_list[k].shape[1] - reg_ch - obj_ch
+                        obj_act_i = img_out_list[k][:, reg_ch:reg_ch+obj_ch]
+                        cls_act_i = img_out_list[k][:, reg_ch+obj_ch:reg_ch+obj_ch+cls_ch_i]
+                        obj_act_min_i = float(obj_act_i.min().detach().cpu()) if obj_act_i.numel() > 0 else 0.0
+                        obj_act_max_i = float(obj_act_i.max().detach().cpu()) if obj_act_i.numel() > 0 else 0.0
+                        cls_act_min_i = float(cls_act_i.min().detach().cpu()) if cls_act_i.numel() > 0 else 0.0
+                        cls_act_max_i = float(cls_act_i.max().detach().cpu()) if cls_act_i.numel() > 0 else 0.0
+                        hsize_i, wsize_i = img_out_list[k].shape[-2:]
+                        print(f"[HybridEvalDebug][image][s{k}] hw=({hsize_i},{wsize_i}), stride={self.strides[k]}, obj_raw=[{obj_raw_min_i:.3f},{obj_raw_max_i:.3f}], cls_raw=[{cls_raw_min_i:.3f},{cls_raw_max_i:.3f}], obj_act=[{obj_act_min_i:.3f},{obj_act_max_i:.3f}], cls_act=[{cls_act_min_i:.3f},{cls_act_max_i:.3f}]")
+                except Exception as _e2:
+                    print(f"[HybridEvalDebug][image][WARN] failed to compute image-branch stats: {repr(_e2)}")
+            except Exception as e:
+                print(f"[HybridEvalDebug][WARN] failed to compute stats: {repr(e)}")
+
         self.hw = [x.shape[-2:] for x in out]
         outputs = torch.cat([x.flatten(start_dim=2) for x in out], dim=2).permute(0, 2, 1)
         return self.decode_outputs(outputs, dtype=out[0].type())

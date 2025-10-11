@@ -21,6 +21,8 @@ class SpikeCAFR(nn.Module):
         self.rgb_in_channels = rgb_in_channels
         self.evt_in_channels = evt_in_channels
         self.out_channels = out_channels
+        self.debug_eval = False
+        self._debug_call_count = 0
 
         self.conv_rgb_in = nn.Conv2d(rgb_in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_rgb_in = nn.BatchNorm2d(out_channels)
@@ -62,6 +64,25 @@ class SpikeCAFR(nn.Module):
         T, B, C_evt, H, W = evt.shape
         evt = self.bn_evt_in(self.conv_evt_in(evt.flatten(0, 1))).view(T, B, self.out_channels, H, W)
 
+        # Debug: feature stats before attention/fusion
+        if self.debug_eval and self._debug_call_count < 5:
+            try:
+                def _stat(x: torch.Tensor):
+                    return (
+                        tuple(x.shape),
+                        float(x.mean().detach().cpu()),
+                        float(x.std().detach().cpu()),
+                        float(x.min().detach().cpu()),
+                        float(x.max().detach().cpu()),
+                    )
+                rgb_s = _stat(rgb)
+                # evt mean over time for readable stats
+                evt_mean_stat = _stat(evt.mean(dim=0))
+                print(f"[FusionDebug] rgb_in: shape={rgb_s[0]}, mean={rgb_s[1]:.4f}, std={rgb_s[2]:.4f}, min={rgb_s[3]:.4f}, max={rgb_s[4]:.4f}", flush=True)
+                print(f"[FusionDebug] evt_in: shape={evt.shape}, mean={evt_mean_stat[1]:.4f}, std={evt_mean_stat[2]:.4f}, min={evt_mean_stat[3]:.4f}, max={evt_mean_stat[4]:.4f}", flush=True)
+            except Exception as _e:
+                print(f"[FusionDebug][WARN] pre-fusion stats failed: {repr(_e)}", flush=True)
+
         # element-wise interaction (REFusion-like)
         evt_mean = evt.mean(dim=0)  # [B,C,H,W]
         mul = rgb * evt_mean
@@ -81,6 +102,26 @@ class SpikeCAFR(nn.Module):
 
         fused = out_rgb + out_evt
         fused = self.bn_out(self.conv_out(fused))
-        return fused + rgb
+        out = fused + rgb
+
+        if self.debug_eval and self._debug_call_count < 5:
+            try:
+                delta = (out - rgb).abs().mean().detach().cpu().item()
+                def _stat(x: torch.Tensor):
+                    return (
+                        tuple(x.shape),
+                        float(x.mean().detach().cpu()),
+                        float(x.std().detach().cpu()),
+                        float(x.min().detach().cpu()),
+                        float(x.max().detach().cpu()),
+                    )
+                out_s = _stat(out)
+                print(f"[FusionDebug] fused_out: shape={out_s[0]}, mean={out_s[1]:.4f}, std={out_s[2]:.4f}, min={out_s[3]:.4f}, max={out_s[4]:.4f}", flush=True)
+                print(f"[FusionDebug] delta_abs_mean={delta:.6f}", flush=True)
+            except Exception as _e2:
+                print(f"[FusionDebug][WARN] post-fusion stats failed: {repr(_e2)}", flush=True)
+
+        self._debug_call_count += 1
+        return out
 
 

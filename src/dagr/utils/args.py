@@ -18,6 +18,9 @@ def BASE_FLAGS():
     parser.add_argument("--pretrain_cnn", action="store_true")
     parser.add_argument("--keep_temporal_ordering", action="store_true")
     parser.add_argument("--debug_unused_params", action="store_true", help="Print parameters that did not receive gradients after backward() on the first iteration")
+    parser.add_argument("--debug_eval", action="store_true", help="Enable verbose debug logs during evaluation (sigmoid stats, candidate counts, shapes/strides)")
+    parser.add_argument("--hybrid_num_scales", type=int, choices=[2, 4], default=4, help="Number of scales to use in Hybrid backbone/head (2 => P4/P5; 4 => P2/P3/P4/P5)")
+    parser.add_argument("--hybrid_image_loss_alpha", type=float, default=0.0, help="Weight for image-branch loss in HybridHead (alpha). Set 0 to disable image loss.")
 
     # task params
     parser.add_argument("--task", default=argparse.SUPPRESS, type=str)

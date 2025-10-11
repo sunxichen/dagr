@@ -42,11 +42,35 @@ class HybridBackbone(nn.Module):
         self.fuse_p4 = SpikeCAFR(rgb_in_channels=c4_ch, evt_in_channels=256, out_channels=c4_ch)
         self.fuse_p5 = SpikeCAFR(rgb_in_channels=c5_ch, evt_in_channels=512, out_channels=c5_ch)
 
-        self.out_channels = [c2_ch, c3_ch, c4_ch, c5_ch]
-        self.strides = [4, 8, 16, 32]
-        self.num_scales = 4
+        full_out_channels = [c2_ch, c3_ch, c4_ch, c5_ch]
+        full_strides = [4, 8, 16, 32]
+
+        # determine number of scales to use (2 => P4/P5, 4 => P2/P3/P4/P5)
+        num_scales = getattr(args, 'hybrid_num_scales', 4)
+        if num_scales not in (2, 4):
+            num_scales = 4
+
+        self.out_channels = full_out_channels[-num_scales:]
+        self.strides = full_strides[-num_scales:]
+        self.num_scales = num_scales
         self.num_classes = self.snn.num_classes
         self.use_image = True
+
+        # optional debug
+        if getattr(args, 'debug_eval', False):
+            try:
+                print(f"[HybridBackbone] using num_scales={self.num_scales}, strides={self.strides}")
+            except Exception:
+                pass
+
+        # propagate debug flag to fusion modules
+        try:
+            dbg = bool(getattr(args, 'debug_eval', False))
+            for m in (self.fuse_p2, self.fuse_p3, self.fuse_p4, self.fuse_p5):
+                if m is not None:
+                    setattr(m, 'debug_eval', dbg)
+        except Exception:
+            pass
 
     def get_output_sizes(self):
         sizes = []
@@ -104,6 +128,10 @@ class HybridBackbone(nn.Module):
 
         fused = [x for x in [fused_p2, fused_p3, fused_p4, fused_p5] if x is not None]
         rgb_only = [x for x in [rgb_c2, rgb_c3, rgb_c4, rgb_c5] if x is not None]
+
+        # align with configured number of scales (take the last N: e.g., P4/P5 when N=2)
+        fused = fused[-self.num_scales:]
+        rgb_only = rgb_only[-self.num_scales:]
         return fused, rgb_only
 
 
