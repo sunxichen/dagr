@@ -179,65 +179,58 @@ class HybridHead(YOLOXHead):
             outputs["obj_output"].append(self.obj_preds[k](reg_feat))
         return outputs
     
-    def _collect_outputs(self, cls_output, reg_output, obj_output, k, stride, ret):
-        """Helper method to collect outputs for loss computation"""
-        # Ensure tensors are contiguous before concatenation
-        reg_output = reg_output.contiguous()
-        obj_output = obj_output.contiguous()
-        cls_output = cls_output.contiguous()
+    def collect_outputs(self, cls_output, reg_output, obj_output, k, stride_this_level, ret=None):
+        """Collect and process outputs - key: distinguish between training and inference"""
+        if self.training:
+            # Training: decode bbox coordinates for loss calculation
+            output = torch.cat([reg_output, obj_output, cls_output], 1)
+            output, grid = self.get_output_and_grid(output, k, stride_this_level, output.type())
+            ret['x_shifts'].append(grid[:, :, 0])
+            ret['y_shifts'].append(grid[:, :, 1])
+            ret['expanded_strides'].append(
+                torch.zeros(1, grid.shape[1]).fill_(stride_this_level).type_as(output)
+            )
+        else:
+            # Inference: keep raw predictions, only add sigmoid
+            output = torch.cat(
+                [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], 1
+            )
         
-        output = torch.cat([reg_output, obj_output, cls_output], 1)
-        ret["outputs"].append(output)
-        ret["origin_preds"].append(torch.cat([reg_output, obj_output, cls_output], 1))
-        
-        # Generate grid
-        batch_size = cls_output.shape[0]
-        hsize, wsize = cls_output.shape[-2:]
-        
-        yv, xv = torch.meshgrid([torch.arange(hsize), torch.arange(wsize)], indexing='ij')
-        grid = torch.stack((xv, yv), 2).view(1, 1, hsize, wsize, 2).type_as(cls_output)
-        grid = grid.view(1, -1, 2)
-        
-        ret["x_shifts"].append(grid[..., 0])
-        ret["y_shifts"].append(grid[..., 1])
-        ret["expanded_strides"].append(torch.full((1, grid.shape[1]), stride, dtype=cls_output.dtype, device=cls_output.device))
+        ret['outputs'].append(output)
 
     def forward(self, xin, labels=None, imgs=None):
         fused_feats, image_feats = xin  # both are [BCHW] lists
 
-        # compute outputs
+        # Compute raw outputs once
         out_fused = self._forward_single(fused_feats)
         out_image = self.image_head(image_feats)
 
-        # collect feature maps
-        fused_ret = dict(outputs=[], origin_preds=[], x_shifts=[], y_shifts=[], expanded_strides=[])
-        image_ret = dict(outputs=[], origin_preds=[], x_shifts=[], y_shifts=[], expanded_strides=[])
-
-        for k in range(self.num_scales):
-            self._collect_outputs(out_fused["cls_output"][k], out_fused["reg_output"][k], out_fused["obj_output"][k], k, self.strides[k], ret=fused_ret)
-            self._collect_outputs(out_image["cls_output"][k], out_image["reg_output"][k], out_image["obj_output"][k], k, self.strides[k], ret=image_ret)
-
         if self.training:
-            # Expect labels to be (labels_fused, labels_image)
+            # Collect and process outputs for training
+            fused_ret = dict(outputs=[], x_shifts=[], y_shifts=[], expanded_strides=[])
+            image_ret = dict(outputs=[], x_shifts=[], y_shifts=[], expanded_strides=[])
+
+            for k in range(self.num_scales):
+                self.collect_outputs(out_fused["cls_output"][k], out_fused["reg_output"][k], 
+                                   out_fused["obj_output"][k], k, self.strides[k], ret=fused_ret)
+                self.collect_outputs(out_image["cls_output"][k], out_image["reg_output"][k], 
+                                   out_image["obj_output"][k], k, self.strides[k], ret=image_ret)
+
             if isinstance(labels, tuple) and len(labels) == 2:
                 labels_fused, labels_image = labels
             else:
                 labels_fused, labels_image = labels, labels
 
-            # Flatten outputs along spatial dimension before concatenating across scales
-            # Ensure contiguous tensors for proper view/reshape operations
-            image_outputs_flat = torch.cat([x.contiguous().flatten(start_dim=2) for x in image_ret['outputs']], dim=2).permute(0, 2, 1).contiguous()
-            fused_outputs_flat = torch.cat([x.contiguous().flatten(start_dim=2) for x in fused_ret['outputs']], dim=2).permute(0, 2, 1).contiguous()
-            
+            # Outputs are already [B, H*W, C] after get_output_and_grid, directly concatenate
             losses_image = self.get_losses(
                 imgs,
                 image_ret['x_shifts'],
                 image_ret['y_shifts'],
                 image_ret['expanded_strides'],
                 labels_image,
-                image_outputs_flat,
-                image_ret['origin_preds'],
-                dtype=image_ret['x_shifts'][0].dtype,
+                torch.cat(image_ret['outputs'], 1),  # [B, total_anchors, C]
+                [],  # origin_preds not needed when use_l1=False
+                dtype=image_feats[0].dtype,
             )
 
             losses_fused = self.get_losses(
@@ -246,23 +239,28 @@ class HybridHead(YOLOXHead):
                 fused_ret['y_shifts'],
                 fused_ret['expanded_strides'],
                 labels_fused,
-                fused_outputs_flat,
-                fused_ret['origin_preds'],
+                torch.cat(fused_ret['outputs'], 1),  # [B, total_anchors, C]
+                [],  # origin_preds not needed when use_l1=False
                 dtype=fused_feats[0].dtype,
             )
 
-            # sum losses element-wise
-            losses_image = list(losses_image)
-            losses_fused = list(losses_fused)
-            for i in range(len(losses_image)):
-                losses_image[i] = losses_image[i] + losses_fused[i]
-            return losses_image
+            # Sum losses element-wise
+            return tuple(l_img + l_fused for l_img, l_fused in zip(losses_image, losses_fused))
 
-        # eval: use fused outputs
-        out = fused_ret['outputs']
-        self.hw = [x.shape[-2:] for x in out]
-        outputs = torch.cat([x.flatten(start_dim=2) for x in out], dim=2).permute(0, 2, 1)
-        return self.decode_outputs(outputs, dtype=out[0].type())
+        else:  # Inference
+            # Collect outputs for inference (no decoding in collect_outputs)
+            fused_ret = dict(outputs=[])
+            for k in range(self.num_scales):
+                self.collect_outputs(out_fused["cls_output"][k], out_fused["reg_output"][k],
+                                   out_fused["obj_output"][k], k, self.strides[k], ret=fused_ret)
+
+            self.hw = [x.shape[-2:] for x in fused_ret['outputs']]
+            # Flatten and concatenate [B, C, H, W] -> [B, total_anchors, C]
+            outputs = torch.cat(
+                [x.flatten(start_dim=2) for x in fused_ret['outputs']], dim=2
+            ).permute(0, 2, 1)
+
+            return self.decode_outputs(outputs, dtype=fused_feats[0].type())
 
 class GNNHead(YOLOXHead):
     def __init__(
