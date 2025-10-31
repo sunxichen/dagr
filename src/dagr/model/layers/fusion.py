@@ -3,6 +3,29 @@ import torch.nn as nn
 
 from dagr.model.layers.spike_cross_attention import CrossAttention
 
+# --- TAFR (AdaIN) 实现 ---
+class AdaIN_block(nn.Module):
+    def __init__(self):
+        super(AdaIN_block, self).__init__()
+
+    def calc_mean_std(self, feat, eps=1e-5):
+        size = feat.size()
+        assert (len(size) == 4)
+        N, C = size[:2]
+        feat_var = feat.view(N, C, -1).var(dim=2) + eps
+        feat_std = feat_var.sqrt().view(N, C, 1, 1)
+        feat_mean = feat.view(N, C, -1).mean(dim=2).view(N, C, 1, 1)
+        return feat_mean, feat_std
+
+    def forward(self, rgb, evt): # (content, style)
+        assert (rgb.size()[:2] == evt.size()[:2])
+        size = rgb.size()
+        style_mean, style_std = self.calc_mean_std(evt)
+        content_mean, content_std = self.calc_mean_std(rgb)
+        normalized_feat = (rgb - content_mean.expand(
+            size)) / content_std.expand(size)
+        return normalized_feat * style_std.expand(size) + style_mean.expand(size)
+# --- TAFR 结束 ---
 
 class SpikeCAFR(nn.Module):
     """
@@ -30,6 +53,11 @@ class SpikeCAFR(nn.Module):
 
         self.rgb_centric_attn = CrossAttention(embed_dims=out_channels, num_heads=num_heads)
         self.evt_centric_attn = CrossAttention(embed_dims=out_channels, num_heads=num_heads)
+
+        # --- 新增：初始化 TAFR (AdaIN) 模块 ---
+        self.tafr_rgb_refine = AdaIN_block() # content=rgb, style=evt_attn_out
+        self.tafr_evt_refine = AdaIN_block() # content=evt, style=rgb_attn_out
+        # --- 新增结束 ---
 
         self.conv_out = nn.Conv2d(out_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
         self.bn_out = nn.BatchNorm2d(out_channels)
@@ -79,7 +107,24 @@ class SpikeCAFR(nn.Module):
         out_evt = self.evt_centric_attn(q_evt, kv_rgb, kv_rgb)  # [T,B,N,C] (T aligned inside)
         out_evt = self._tbnc_to_bchw(out_evt, H, W)
 
-        fused = out_rgb + out_evt
+        # --- 4. 新增：TAFR (Post-Attention Refinement) ---
+        # 遵循 FRN 逻辑: z = adain(content=x[0], style=W_y)
+        
+        # 细化 BCI 的 RGB 特征 (content=rgb_enh)
+        # 使用 Event-centric attention 的输出作为 style (style=out_evt)
+        # 这是 FRN 中 rgb_cross_attention([rgb1, evt1]) -> adain(rgb1, Attn(v=rgb1, qk=evt1)) 的类比
+        # 这里 SpikeCAFR 的 out_evt 是 Attn(q=evt, kv=rgb)，逻辑更对称
+        rgb_refined = self.tafr_rgb_refine(rgb_enh, out_evt)
+
+        # 细化 BCI 的 Event 特征 (content=evt_enh.mean(0))
+        # 使用 RGB-centric attention 的输出作为 style (style=out_rgb)
+        evt_refined = self.tafr_evt_refine(evt_enh.mean(0), out_rgb)
+        # --- TAFR 结束 ---
+
+        # --- 修改：TAFR后融合 ---
+        # fused = out_rgb + out_evt
+        fused = rgb_refined + evt_refined
+        
         fused = self.bn_out(self.conv_out(fused))
         return fused + rgb
 
