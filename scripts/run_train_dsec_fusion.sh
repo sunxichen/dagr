@@ -8,6 +8,9 @@ set -euo pipefail
 # export CUDA_VISIBLE_DEVICES=0
 
 export WANDB_MODE=disabled
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
+export DISTRIBUTED=1
+export NO_EVAL=${NO_EVAL:-0}
 
 # Paths
 PYTHON=python
@@ -15,16 +18,16 @@ TORCHRUN=torchrun
 TRAIN_SCRIPT=scripts/train_dsec.py
 
 # Output
-OUTPUT_DIR=/root/autodl-tmp/runs/dsec_snn
-EXP_NAME=snn_yaml_s_fasttrend
+OUTPUT_DIR=/root/autodl-tmp/runs/dsec_fusion
+EXP_NAME=fusion_s_fasttrend
 
 # SNN backbone config
 SNN_YAML=src/dagr/cfg/snn_yolov8.yaml
 SNN_SCALE=s
 SNN_TEMPORAL_BINS=4
 
-# Hyperparameters (default to config's baseline)
-BATCH_SIZE=32
+# Hyperparameters (per-GPU semantics)
+BATCH_SIZE=1
 EPOCHS=801
 LR=0.0002
 WEIGHT_DECAY=0.00001
@@ -32,7 +35,7 @@ WEIGHT_DECAY=0.00001
 # Dataset settings (adjust DATASET_DIR if needed)
 DATASET=dsec
 # Experiment trend mode: fast | mid | full
-EXP_TREND=full
+EXP_TREND=fast
 # If FLAGS expects a dataset directory, set it via --dataset_directory
 # Example: DATASET_DIR=/path/to/DSEC
 DATASET_DIR=/root/autodl-tmp
@@ -43,6 +46,12 @@ mkdir -p "$OUTPUT_DIR"
 
 echo "Training log will be saved to: $LOG_FILE"
 echo "Starting training..."
+
+# Optional flags
+NO_EVAL_FLAG=()
+if [[ "${NO_EVAL}" -eq 1 ]]; then
+  NO_EVAL_FLAG+=(--no_eval)
+fi
 
 # If DISTRIBUTED=1, run with torchrun and enable --distributed
 if [[ "${DISTRIBUTED:-0}" -eq 1 ]]; then
@@ -67,10 +76,14 @@ if [[ "${DISTRIBUTED:-0}" -eq 1 ]]; then
     --weight_decay "$WEIGHT_DECAY" \
     --exp_trend "$EXP_TREND" \
     --use_snn_backbone \
+    --use_image \
     --snn_yaml_path "$SNN_YAML" \
     --snn_scale "$SNN_SCALE" \
     --snn_temporal_bins "$SNN_TEMPORAL_BINS" \
     --dataset_directory "$DATASET_DIR" \
+    --debug_unused_params \
+    --print_param_index_map \
+    "${NO_EVAL_FLAG[@]}" \
     2>&1 | tee "$LOG_FILE"
 else
   $PYTHON "$TRAIN_SCRIPT" \
@@ -84,10 +97,14 @@ else
     --weight_decay "$WEIGHT_DECAY" \
     --exp_trend "$EXP_TREND" \
     --use_snn_backbone \
+    --use_image \
+    --img_net resnet50 \
+    --accum_steps 4 \
     --snn_yaml_path "$SNN_YAML" \
     --snn_scale "$SNN_SCALE" \
     --snn_temporal_bins "$SNN_TEMPORAL_BINS" \
     --dataset_directory "$DATASET_DIR" \
+    "${NO_EVAL_FLAG[@]}" \
     2>&1 | tee "$LOG_FILE"
 fi
 

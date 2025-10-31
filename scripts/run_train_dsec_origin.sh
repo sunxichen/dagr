@@ -19,12 +19,12 @@ OUTPUT_DIR=/root/autodl-tmp/runs/dsec_snn
 EXP_NAME=snn_yaml_s_fasttrend
 
 # SNN backbone config
-SNN_YAML=src/dagr/cfg/snn_yolov8.yaml
-SNN_SCALE=s
-SNN_TEMPORAL_BINS=4
+# SNN_YAML=src/dagr/cfg/snn_yolov8.yaml
+# SNN_SCALE=s
+# SNN_TEMPORAL_BINS=4
 
 # Hyperparameters (default to config's baseline)
-BATCH_SIZE=32
+BATCH_SIZE=1
 EPOCHS=801
 LR=0.0002
 WEIGHT_DECAY=0.00001
@@ -32,7 +32,7 @@ WEIGHT_DECAY=0.00001
 # Dataset settings (adjust DATASET_DIR if needed)
 DATASET=dsec
 # Experiment trend mode: fast | mid | full
-EXP_TREND=full
+EXP_TREND=fast
 # If FLAGS expects a dataset directory, set it via --dataset_directory
 # Example: DATASET_DIR=/path/to/DSEC
 DATASET_DIR=/root/autodl-tmp
@@ -83,10 +83,8 @@ else
     --l_r "$LR" \
     --weight_decay "$WEIGHT_DECAY" \
     --exp_trend "$EXP_TREND" \
-    --use_snn_backbone \
-    --snn_yaml_path "$SNN_YAML" \
-    --snn_scale "$SNN_SCALE" \
-    --snn_temporal_bins "$SNN_TEMPORAL_BINS" \
+    --use_image \
+    --img_net resnet50 \
     --dataset_directory "$DATASET_DIR" \
     2>&1 | tee "$LOG_FILE"
 fi
