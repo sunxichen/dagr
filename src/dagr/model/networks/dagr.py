@@ -1,6 +1,7 @@
 import torch
 
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from torch_geometric.data import Data
 from yolox.models import YOLOX, YOLOXHead, IOUloss
@@ -10,14 +11,99 @@ try:
     from dagr.model.networks.snn_backbone_yaml import SNNBackboneYAMLWrapper
 except Exception:
     SNNBackboneYAMLWrapper = None
-try:
-    from dagr.model.networks.hybrid_backbone import HybridBackbone
-except Exception:
-    HybridBackbone = None
+# try:
+#     from dagr.model.networks.hybrid_backbone import HybridBackbone
+# except Exception:
+#     HybridBackbone = None
+from dagr.model.networks.hybrid_backbone import HybridBackbone
 from dagr.model.layers.spline_conv import SplineConvToDense
 from dagr.model.layers.conv import ConvBlock
 from dagr.model.utils import shallow_copy, init_subnetwork, voxel_size_to_params, postprocess_network_output, convert_to_evaluation_format, init_grid_and_stride, convert_to_training_format
 
+# --- 新增: HybridHeadV2 (用于三分支训练) ---
+class HybridHeadV2(YOLOXHead):
+    def __init__(self, num_classes, strides, 
+                 in_channels_fused, 
+                 in_channels_image, 
+                 in_channels_mad, 
+                 act="silu", depthwise=False, width=1.0, args=None):
+        
+        # 注意：YOLOXHead 的 'width' 参数会缩放 'in_channels'
+        # 我们在这里假设 'width' 已经应用在 backbone 的输出通道上
+        # 或者我们在这里为每个 head 设置 width=1.0
+        
+        # 我们需要一个 YOLOXHead 来处理 'super' 调用，但我们实际上将使用 3 个
+        super().__init__(num_classes, width=1.0, strides=strides, in_channels=in_channels_fused, act=act, depthwise=depthwise)
+        
+        self.strides = strides
+        self.num_scales = len(in_channels_fused)
+
+        # 1. Fused Head (用于推理和训练)
+        self.fused_head = YOLOXHead(num_classes, width=1.0, strides=strides, in_channels=in_channels_fused, act=act, depthwise=depthwise)
+        
+        # 2. Image Head (仅用于训练)
+        self.image_head = YOLOXHead(num_classes, width=1.0, strides=strides, in_channels=in_channels_image, act=act, depthwise=depthwise)
+        
+        # 3. MAD Head (仅用于训练)
+        self.mad_head = YOLOXHead(num_classes, width=1.0, strides=strides, in_channels=in_channels_mad, act=act, depthwise=depthwise)
+
+        self.use_checkpointing = getattr(args, 'use_checkpointing', False) if args else False
+
+    def forward(self, xin, labels=None, imgs=None):
+        
+        if self.training:
+            # 1. 解包特征和标签
+            fused_feats, image_feats, mad_feats = xin
+            # 假设标签元组为 (labels_fused, labels_image, labels_mad)
+            labels_fused, labels_image, labels_mad = labels
+
+            if self.use_checkpointing:
+                losses_fused = activation_checkpoint(self.fused_head, fused_feats, labels_fused, imgs, use_reentrant=False)
+                losses_image = activation_checkpoint(self.image_head, image_feats, labels_image, imgs, use_reentrant=False)
+                if mad_feats is not None:
+                    losses_mad = activation_checkpoint(self.mad_head, mad_feats, labels_mad, imgs, use_reentrant=False)
+                else:
+                    # losses_mad = {
+                    #     'total_loss': 0.0, 'loss_cls': 0.0, 'loss_conf': 0.0, 'loss_reg': 0.0, 'num_fg': 0
+                    # }
+                    zero_loss = torch.tensor(0.0, device=fused_feats[0].device, dtype=fused_feats[0].dtype)
+                    losses_mad = (zero_loss, zero_loss, zero_loss, zero_loss, zero_loss, 0.0)
+            else:
+
+                # 2. 计算 Fused 分支损失
+                losses_fused = self.fused_head(fused_feats, labels_fused, imgs)
+                
+                # 3. 计算 Image 分支损失
+                losses_image = self.image_head(image_feats, labels_image, imgs)
+
+                # 4. 计算 MAD 分支损失
+                if mad_feats is not None:
+                    losses_mad = self.mad_head(mad_feats, labels_mad, imgs)
+                else:
+                    # 如果 MAD 分支失败 (例如，在推理或数据转换失败时)
+                    # losses_mad = {
+                    #     'total_loss': 0.0, 'loss_cls': 0.0, 'loss_conf': 0.0, 'loss_reg': 0.0, 'num_fg': 0
+                    # }
+                    zero_loss = torch.tensor(0.0, device=fused_feats[0].device, dtype=fused_feats[0].dtype)
+                    losses_mad = (zero_loss, zero_loss, zero_loss, zero_loss, zero_loss, 0.0)
+
+            # 5. 合并损失
+            # total_loss = losses_fused['total_loss'] + losses_image['total_loss'] + losses_mad['total_loss']
+            total_loss = losses_fused[0] + losses_image[0] + losses_mad[0]
+            iou_loss = losses_fused[1] + losses_image[1] + losses_mad[1]
+            obj_loss = losses_fused[2] + losses_image[2] + losses_mad[2]
+            cls_loss = losses_fused[3] + losses_image[3] + losses_mad[3]
+            l1_loss = losses_fused[4] + losses_image[4] + losses_mad[4]
+            num_fg = losses_fused[5] + losses_image[5] + losses_mad[5]
+            
+            # 返回 YOLOX.forward所期望的 *元组*
+            return (total_loss, iou_loss, obj_loss, cls_loss, l1_loss, num_fg)
+
+        else: # --- 推理 ---
+            # 仅使用 Fused 分支
+            fused_feats, _, _ = xin
+            return self.fused_head(fused_feats)
+# --- HybridHeadV2 结束 ---
 
 class DAGR(YOLOX):
     def __init__(self, args, height, width):
@@ -34,12 +120,26 @@ class DAGR(YOLOX):
         print(f"Debug: use_image: {use_image}")
 
         if use_snn and getattr(args, 'use_image', False) and HybridBackbone is not None:
-            print(f"Debug: running with hybrid backbone")
+            # --- Moddified for 3-branch hybrid backbone (Fused, RGB, MAD) ---
+            # print(f"Debug: running with hybrid backbone")
+            # backbone = HybridBackbone(args, height=height, width=width)
+            # head = HybridHead(num_classes=backbone.num_classes,
+            #                    strides=backbone.strides,
+            #                    in_channels=backbone.out_channels,
+            #                    args=args)
+            # --- Modified end ---
+            print(f"Debug: running with 3-branch hybrid backbone (Fused, RGB, MAD)")
             backbone = HybridBackbone(args, height=height, width=width)
-            head = HybridHead(num_classes=backbone.num_classes,
-                               strides=backbone.strides,
-                               in_channels=backbone.out_channels,
-                               args=args)
+
+            rgb_all_channels = backbone.rgb.feature_channels + backbone.rgb.output_channels
+            head = HybridHeadV2(
+                num_classes=backbone.num_classes,
+                strides=backbone.strides,
+                in_channels_fused=backbone.out_channels,     # SNN-fused
+                in_channels_image=rgb_all_channels, # RGB-only
+                in_channels_mad=backbone.mad_backbone.out_channels, # MAD-only
+                args=args
+            )
         elif use_snn:
             yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
             scale = getattr(args, 'snn_scale', 's')
@@ -104,7 +204,12 @@ class DAGR(YOLOX):
                 self.head.obj_pred2.init_lut(height=height, width=width, Mx=M, rx=rx, ry=ry)
 
     def forward(self, x: Data, reset=True, return_targets=True, filtering=True):
-        if not hasattr(self.head, "output_sizes"):
+        # --- Modified for 3-branch hybrid backbone (Fused, RGB, MAD) ---
+        # if not hasattr(self.head, "output_sizes"):
+        #     self.head.output_sizes = self.backbone.get_output_sizes()
+        # --- Modified end ---
+
+        if not hasattr(self.head, "output_sizes") and hasattr(self.backbone, "get_output_sizes"):
             self.head.output_sizes = self.backbone.get_output_sizes()
 
         if self.training:
@@ -112,12 +217,21 @@ class DAGR(YOLOX):
 
             if self.backbone.use_image:
                 targets0 = convert_to_training_format(x.bbox0, x.bbox0_batch, x.num_graphs)
-                targets = (targets, targets0)
-
-            # gt_target inputs need to be [l cx cy w h] in pixels
-            outputs = YOLOX.forward(self, x, targets)
+                # --- Modified for 3-branch hybrid backbone (Fused, RGB, MAD) ---
+                # 假设MAD分支也应该预测当前帧 (targets)，而不是前一帧 (targets0)
+                targets_tuple = (targets, targets0, targets)
+                outputs = YOLOX.forward(self, x, targets_tuple)
+                # targets = (targets, targets0)
+                # --- Modified end ---
+            else:
+                outputs = YOLOX.forward(self, x, targets)
 
             return outputs
+
+            # gt_target inputs need to be [l cx cy w h] in pixels
+            # outputs = YOLOX.forward(self, x, targets)
+
+            # return outputs
 
         x.reset = reset
 

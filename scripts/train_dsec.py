@@ -128,6 +128,11 @@ def train(loader: DataLoader,
         total_loss_sum += float(loss.item()) * accum_steps
         num_steps += 1 if step_in_accum == 0 else 0
 
+        # [需要被注释掉] --- 在这里添加新行 ---
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        # --- 添加结束 ---
+
     # return mean loss for console print
     mean_loss = total_loss_sum / max(1, num_steps)
     return mean_loss
@@ -213,10 +218,20 @@ if __name__ == '__main__':
     print("init datasets")
     dataset_path = args.dataset_directory / args.dataset
 
+    # train_dataset = DSEC(root=dataset_path, split="train", transform=augmentations.transform_training, debug=False,
+    #                      min_bbox_diag=15, min_bbox_height=10)
+    # test_dataset = DSEC(root=dataset_path, split="val", transform=augmentations.transform_testing, debug=False,
+    #                     min_bbox_diag=15, min_bbox_height=10)
+    # --- 修正：强制 scale=4 以减少 VRAM 占用 ---
+    # 注意：这仅用于 24GB 显存的 OOM 测试
+    forced_scale = 4
+    print(f"\033[93mWARNING: Forcing data scale to {forced_scale} to fit in 24GB VRAM.\033[0m")
+    
     train_dataset = DSEC(root=dataset_path, split="train", transform=augmentations.transform_training, debug=False,
-                         min_bbox_diag=15, min_bbox_height=10)
+                         min_bbox_diag=15, min_bbox_height=10, scale=forced_scale)
     test_dataset = DSEC(root=dataset_path, split="val", transform=augmentations.transform_testing, debug=False,
-                        min_bbox_diag=15, min_bbox_height=10)
+                        min_bbox_diag=15, min_bbox_height=10, scale=forced_scale)
+    # --- 修正结束 ---
 
     # Experiment trend modes: fast / mid / full
     # fast: train+val use subsets; evaluate every epoch on fast subset, no full eval
