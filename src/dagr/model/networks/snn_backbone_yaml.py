@@ -27,9 +27,12 @@ class SNNBackboneYAMLWrapper(nn.Module):
 
 
     def forward(self, data, reset: bool = True):
-        # pass Data to backbone; MS_GetT_Voxel will voxelize to [T,B,2,H,W]
-        setattr(data, 'meta_height', self.height)
-        setattr(data, 'meta_width', self.width)
+
+        if not hasattr(data, 'meta_height'):
+            setattr(data, 'meta_height', self.height)
+        if not hasattr(data, 'meta_width'):
+            setattr(data, 'meta_width', self.width)
+
         p2, p3, p4, p5 = self.backbone(data)
         # aggregate time: mean over T -> BCHW
         p4_bchw = p4.mean(dim=0) if p4 is not None else None
@@ -46,8 +49,12 @@ class SNNBackboneYAMLWrapper(nn.Module):
         Return multi-scale features with temporal dimension preserved.
         Output: dict with keys 'p4','p5' and values [T,B,C,H,W].
         """
-        setattr(data, 'meta_height', self.height)
-        setattr(data, 'meta_width', self.width)
+
+        if not hasattr(data, 'meta_height'):
+            setattr(data, 'meta_height', self.height)
+        if not hasattr(data, 'meta_width'):
+            setattr(data, 'meta_width', self.width)
+
         p2, p3, p4, p5 = self.backbone(data)
         ret = {}
         if p2 is not None:

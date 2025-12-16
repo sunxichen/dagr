@@ -32,7 +32,7 @@ from dagr.data.dsec_data import DSEC
 from dagr.model.networks.dagr import DAGR
 from dagr.model.networks.ema import ModelEMA
 
-
+# torch.autograd.set_detect_anomaly(True)
 def gradients_broken(model):
     valid_gradients = True
     for name, param in model.named_parameters():
@@ -81,6 +81,7 @@ def train(loader: DataLoader,
         loss = loss_dict.pop("total_loss")
 
         loss = loss / accum_steps
+        # torch.autograd.set_detect_anomaly(True)
         loss.backward()
 
         # Debug: list parameters without gradients
@@ -128,10 +129,8 @@ def train(loader: DataLoader,
         total_loss_sum += float(loss.item()) * accum_steps
         num_steps += 1 if step_in_accum == 0 else 0
 
-        # [需要被注释掉] --- 在这里添加新行 ---
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        # --- 添加结束 ---
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
 
     # return mean loss for console print
     mean_loss = total_loss_sum / max(1, num_steps)

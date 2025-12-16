@@ -110,7 +110,6 @@ else
     --dataset_directory "$DATASET_DIR" \
     --mad_flow_checkpoint "$MAD_FLOW_CHECKPOINT" \
     --use_checkpointing \
-    --n_nodes 20000 \
     --no_load_mad_flow \
     "${NO_EVAL_FLAG[@]}" \
     2>&1 | tee "$LOG_FILE"
