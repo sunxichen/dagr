@@ -11,6 +11,14 @@ def BASE_FLAGS():
     parser.add_argument("--checkpoint", type=Path, default=argparse.SUPPRESS, help="Path to the directory containing the checkpoint.")
     parser.add_argument("--img_net", default=argparse.SUPPRESS, type=str)
     parser.add_argument("--img_net_checkpoint", type=Path, default=argparse.SUPPRESS)
+    # --- Modified for 3-branch hybrid backbone (Fused, RGB, MAD) ---
+    parser.add_argument("--mad_flow_checkpoint", type=Path, default=argparse.SUPPRESS,
+                        help="Path to the pre-trained EVFlowNet checkpoint for the MAD branch.")
+    parser.add_argument("--no_load_mad_flow", action="store_true",
+                        help="Do not load a pre-trained EVFlowNet checkpoint; use random weights instead for debugging.")
+    parser.add_argument("--use_checkpointing", action="store_true",
+                        help="Use activation checkpointing to save VRAM at the cost of computation.")
+    # --- Modified end ---
 
     parser.add_argument("--config", type=Path, default="../config/detection.yaml")
     parser.add_argument("--use_image", action="store_true")
@@ -89,6 +97,11 @@ def FLAGS():
 
     if "checkpoint" in args:
         args.checkpoint = Path(args.checkpoint)
+    
+    # --- Modified for 3-branch hybrid backbone (Fused, RGB, MAD) ---
+    if args.mad_flow_checkpoint is not None:
+        args.mad_flow_checkpoint = Path(args.mad_flow_checkpoint)
+    # --- Modified end ---
 
     return args
 
@@ -110,6 +123,11 @@ def FLOPS_FLAGS():
 
     if "checkpoint" in args:
         args.checkpoint = Path(args.checkpoint)
+
+    # --- Modified for 3-branch hybrid backbone (Fused, RGB, MAD) ---
+    if args.mad_flow_checkpoint is not None:
+        args.mad_flow_checkpoint = Path(args.mad_flow_checkpoint)
+    # --- Modified end ---
 
     return args
 

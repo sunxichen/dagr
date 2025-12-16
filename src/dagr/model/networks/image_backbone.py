@@ -52,7 +52,7 @@ class ImageBackbone(nn.Module):
 
         # Exposed mapped channel specs for consumers (HybridBackbone)
         self.feature_channels = [channels[1], channels[2]]  # for layer1, layer2
-        self.output_channels = [256, 256]                   # for layer3, layer4 outputs
+        self.output_channels = [256, 512]                   # for layer3, layer4 outputs
 
         # 1x1 projections only for consumed taps
         # feature taps

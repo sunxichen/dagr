@@ -32,7 +32,7 @@ from dagr.data.dsec_data import DSEC
 from dagr.model.networks.dagr import DAGR
 from dagr.model.networks.ema import ModelEMA
 
-
+# torch.autograd.set_detect_anomaly(True)
 def gradients_broken(model):
     valid_gradients = True
     for name, param in model.named_parameters():
@@ -81,6 +81,7 @@ def train(loader: DataLoader,
         loss = loss_dict.pop("total_loss")
 
         loss = loss / accum_steps
+        # torch.autograd.set_detect_anomaly(True)
         loss.backward()
 
         # Debug: list parameters without gradients
@@ -127,6 +128,9 @@ def train(loader: DataLoader,
         # accumulate for epoch mean
         total_loss_sum += float(loss.item()) * accum_steps
         num_steps += 1 if step_in_accum == 0 else 0
+
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
 
     # return mean loss for console print
     mean_loss = total_loss_sum / max(1, num_steps)
@@ -213,10 +217,20 @@ if __name__ == '__main__':
     print("init datasets")
     dataset_path = args.dataset_directory / args.dataset
 
+    # train_dataset = DSEC(root=dataset_path, split="train", transform=augmentations.transform_training, debug=False,
+    #                      min_bbox_diag=15, min_bbox_height=10)
+    # test_dataset = DSEC(root=dataset_path, split="val", transform=augmentations.transform_testing, debug=False,
+    #                     min_bbox_diag=15, min_bbox_height=10)
+    # --- 修正：强制 scale=4 以减少 VRAM 占用 ---
+    # 注意：这仅用于 24GB 显存的 OOM 测试
+    forced_scale = 4
+    print(f"\033[93mWARNING: Forcing data scale to {forced_scale} to fit in 24GB VRAM.\033[0m")
+    
     train_dataset = DSEC(root=dataset_path, split="train", transform=augmentations.transform_training, debug=False,
-                         min_bbox_diag=15, min_bbox_height=10)
+                         min_bbox_diag=15, min_bbox_height=10, scale=forced_scale)
     test_dataset = DSEC(root=dataset_path, split="val", transform=augmentations.transform_testing, debug=False,
-                        min_bbox_diag=15, min_bbox_height=10)
+                        min_bbox_diag=15, min_bbox_height=10, scale=forced_scale)
+    # --- 修正结束 ---
 
     # Experiment trend modes: fast / mid / full
     # fast: train+val use subsets; evaluate every epoch on fast subset, no full eval

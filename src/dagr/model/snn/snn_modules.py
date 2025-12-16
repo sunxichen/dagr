@@ -385,9 +385,14 @@ class MS_GetT_Voxel(nn.Module):
             return data_or_tensor.unsqueeze(0).repeat(self.T, 1, 1, 1, 1)
 
         data = data_or_tensor
+
+        H_meta = getattr(data, 'meta_height', None)
+        W_meta = getattr(data, 'meta_width', None)
         
-        H = self.height if self.height is not None else getattr(data, 'meta_height', None)
-        W = self.width if self.width is not None else getattr(data, 'meta_width', None)
+        H = H_meta if H_meta is not None else self.height
+        W = W_meta if W_meta is not None else self.width
+
+        
         assert H is not None and W is not None, "Height/Width must be provided to MS_GetT_Voxel via constructor or data.meta_*"
         H = int(H)
         W = int(W)
