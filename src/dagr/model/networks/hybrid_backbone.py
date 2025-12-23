@@ -7,6 +7,7 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from dagr.model.networks.image_backbone import ImageBackbone
 from dagr.model.networks.snn_backbone_yaml import SNNBackboneYAMLWrapper
 from dagr.model.layers.fusion import SpikeCAFR
+from dagr.model.backbones.sdt_v3 import SpikformerV3Extractor
 
 from dagr.model.mad_imports.flow_models.model import EVFlowNet
 from dagr.model.mad_imports.utils.iwe import compute_pol_iwe, get_interpolation, interpolate, purge_unfeasible
@@ -35,16 +36,12 @@ class HybridBackbone(nn.Module):
         self.height = int(height)
         self.width = int(width)
         self.num_bins_mad = 5 # 来自 mad_representation config
+        self.use_sdt_v3 = str(getattr(args, "backbone_type", "")).lower() == "sdtv3"
 
         # RGB backbone using minimal ImageBackbone; will run image path and expose 4 stages
         args_local = args
         args_local.use_image = True
         self.rgb = ImageBackbone(args_local, height=height, width=width)
-
-        # SNN backbone (temporal features)
-        yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
-        scale = getattr(args, 'snn_scale', 's')
-        self.snn = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
 
         # derive channel dimensions from ImageBackbone exposed specs
         c2_ch = self.rgb.feature_channels[0]
@@ -52,10 +49,27 @@ class HybridBackbone(nn.Module):
         c4_ch = self.rgb.output_channels[0]
         c5_ch = self.rgb.output_channels[1]
 
-        self.fuse_p2 = SpikeCAFR(rgb_in_channels=c2_ch, evt_in_channels=64, out_channels=c2_ch)
-        self.fuse_p3 = SpikeCAFR(rgb_in_channels=c3_ch, evt_in_channels=128, out_channels=c3_ch)
-        self.fuse_p4 = SpikeCAFR(rgb_in_channels=c4_ch, evt_in_channels=256, out_channels=c4_ch)
-        self.fuse_p5 = SpikeCAFR(rgb_in_channels=c5_ch, evt_in_channels=512, out_channels=c5_ch)
+        # Event backbone (temporal features)
+        if self.use_sdt_v3:
+            self.snn = SpikformerV3Extractor(args, height=height, width=width)
+            evt_channels = list(self.snn.out_channels)
+            # Align image scales to strides [8,16,32] -> RGB c3,c4,c5
+            rgb_fuse_channels = [s, c4_ch, c5_ch]
+            self.strides = [8, 16, 32]
+            self.out_channels = rgb_fuse_channels
+        else:
+            yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
+            scale = getattr(args, 'snn_scale', 's')
+            self.snn = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
+            evt_channels = list(getattr(self.snn, "out_channels", [64, 128, 256, 512]))
+            rgb_fuse_channels = [c2_ch, c3_ch, c4_ch, c5_ch]
+            self.strides = [4, 8, 16, 32]
+            self.out_channels = rgb_fuse_channels
+
+        # Build fusion modules aligned to the active event backbone
+        self.fuse_modules = nn.ModuleList()
+        for rgb_ch, evt_ch in zip(rgb_fuse_channels, evt_channels):
+            self.fuse_modules.append(SpikeCAFR(rgb_in_channels=rgb_ch, evt_in_channels=evt_ch, out_channels=rgb_ch))
 
         # --- MAD branch ---
         # 1. EVFlowNet (用于 T_m)
@@ -93,9 +107,7 @@ class HybridBackbone(nn.Module):
 
         self.use_checkpointing = getattr(args, 'use_checkpointing', False)
 
-        self.out_channels = [c2_ch, c3_ch, c4_ch, c5_ch]
-        self.strides = [4, 8, 16, 32]
-        self.num_scales = 4
+        self.num_scales = len(self.out_channels)
         self.num_classes = self.snn.num_classes
         self.use_image = True
 
@@ -213,11 +225,17 @@ class HybridBackbone(nn.Module):
         setattr(data, 'meta_height', self.mad_H_pad)
         setattr(data, 'meta_width', self.mad_W_pad)
 
-        # SNN temporal features
-        if self.training and self.use_checkpointing:
-            snn_feats = activation_checkpoint(self.snn.forward_time, data, use_reentrant=False)
+        # Event temporal features
+        if self.use_sdt_v3:
+            # SpikformerV3Extractor already handles checkpointing internally
+            snn_feats_list = self.snn(data)
+            event_feats = snn_feats_list
         else:
-            snn_feats = self.snn.forward_time(data) 
+            if self.training and self.use_checkpointing:
+                snn_feats = activation_checkpoint(self.snn.forward_time, data, use_reentrant=False)
+            else:
+                snn_feats = self.snn.forward_time(data) 
+            event_feats = [snn_feats.get("p2"), snn_feats.get("p3"), snn_feats.get("p4"), snn_feats.get("p5")]
         
 
         if hasattr(data, 'meta_height'):
@@ -226,25 +244,22 @@ class HybridBackbone(nn.Module):
              delattr(data, 'meta_width')
 
 
-        p2_t = snn_feats.get("p2")
-        p3_t = snn_feats.get("p3")
-        p4_t = snn_feats.get("p4")
-        p5_t = snn_feats.get("p5")
-
-        if self.training and self.use_checkpointing:
-            fused_p2 = activation_checkpoint(self.fuse_p2, rgb_c2, p2_t, use_reentrant=False) if (rgb_c2 is not None and p2_t is not None) else None
-            fused_p3 = activation_checkpoint(self.fuse_p3, rgb_c3, p3_t, use_reentrant=False) if (rgb_c3 is not None and p3_t is not None) else None
-            fused_p4 = activation_checkpoint(self.fuse_p4, rgb_c4, p4_t, use_reentrant=False) if (rgb_c4 is not None and p4_t is not None) else None
-            fused_p5 = activation_checkpoint(self.fuse_p5, rgb_c5, p5_t, use_reentrant=False) if (rgb_c5 is not None and p5_t is not None) else None
+        # Select RGB feature list to align with strides/out_channels
+        if self.use_sdt_v3:
+            rgb_feats = [rgb_c3, rgb_c4, rgb_c5]
         else:
-            fused_p2 = self.fuse_p2(rgb_c2, p2_t) if (rgb_c2 is not None and p2_t is not None) else None
-            fused_p3 = self.fuse_p3(rgb_c3, p3_t) if (rgb_c3 is not None and p3_t is not None) else None
-            fused_p4 = self.fuse_p4(rgb_c4, p4_t) if (rgb_c4 is not None and p4_t is not None) else None
-            fused_p5 = self.fuse_p5(rgb_c5, p5_t) if (rgb_c5 is not None and p5_t is not None) else None
+            rgb_feats = [rgb_c2, rgb_c3, rgb_c4, rgb_c5]
 
-        fused = [x for x in [fused_p2, fused_p3, fused_p4, fused_p5] if x is not None]
-        rgb_only = [x for x in [rgb_c2, rgb_c3, rgb_c4, rgb_c5] if x is not None]
-        
+        fused = []
+        for rgb_feat, evt_feat, fuse in zip(rgb_feats, event_feats, self.fuse_modules):
+            if rgb_feat is None or evt_feat is None:
+                continue
+            if self.training and self.use_checkpointing and not self.use_sdt_v3:
+                fused.append(activation_checkpoint(fuse, rgb_feat, evt_feat, use_reentrant=False))
+            else:
+                fused.append(fuse(rgb_feat, evt_feat))
+
+        rgb_only = [x for x in rgb_feats if x is not None]
 
         mad_feats = None
         if self.training:
@@ -288,6 +303,10 @@ class HybridBackbone(nn.Module):
                 mad_feats = activation_checkpoint(self.mad_backbone, T_a_padded_for_backbone, T_m_padded_for_backbone, use_reentrant=False)
             else:
                 mad_feats = self.mad_backbone(T_a_padded_for_backbone, T_m_padded_for_backbone)
+
+            # Align MAD scales with current strides (drop P2 when using SDT-V3)
+            if mad_feats is not None and len(mad_feats) > self.num_scales:
+                mad_feats = mad_feats[-self.num_scales:]
         # --- MAD branch end ---
 
         # mad_feats=None in inference

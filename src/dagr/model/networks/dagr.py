@@ -16,6 +16,7 @@ except Exception:
 # except Exception:
 #     HybridBackbone = None
 from dagr.model.networks.hybrid_backbone import HybridBackbone
+from dagr.model.backbones.sdt_v3 import SpikformerV3Extractor
 from dagr.model.layers.spline_conv import SplineConvToDense
 from dagr.model.layers.conv import ConvBlock
 from dagr.model.utils import shallow_copy, init_subnetwork, voxel_size_to_params, postprocess_network_output, convert_to_evaluation_format, init_grid_and_stride, convert_to_training_format
@@ -218,7 +219,8 @@ class DAGR(YOLOX):
         self.height = height
         self.width = width
 
-        use_snn = hasattr(args, 'use_snn_backbone') and getattr(args, 'use_snn_backbone') and SNNBackboneYAMLWrapper is not None
+        use_sdt = str(getattr(args, 'backbone_type', '')).lower() == 'sdtv3'
+        use_snn = hasattr(args, 'use_snn_backbone') and getattr(args, 'use_snn_backbone') and (use_sdt or SNNBackboneYAMLWrapper is not None)
         print(f"Debug: use_snn: {use_snn}")
 
         use_image = hasattr(args, 'use_image') and getattr(args, 'use_image')
@@ -229,19 +231,30 @@ class DAGR(YOLOX):
             print(f"Debug: running with 3-branch hybrid backbone (Fused, RGB, MAD)")
             backbone = HybridBackbone(args, height=height, width=width)
 
-            rgb_all_channels = backbone.rgb.feature_channels + backbone.rgb.output_channels
+            # Align channel lists with the active backbone (SNN vs SDT-V3)
+            if getattr(backbone, 'use_sdt_v3', False):
+                in_channels_image = backbone.out_channels  # [c3, c4, c5]
+                in_channels_mad = list(getattr(backbone.mad_backbone, 'out_channels', []))[-backbone.num_scales:]
+            else:
+                rgb_all_channels = backbone.rgb.feature_channels + backbone.rgb.output_channels
+                in_channels_image = rgb_all_channels
+                in_channels_mad = backbone.mad_backbone.out_channels
+
             head = HybridHeadV2(
                 num_classes=backbone.num_classes,
                 strides=backbone.strides,
                 in_channels_fused=backbone.out_channels,     # SNN-fused
-                in_channels_image=rgb_all_channels, # RGB-only
-                in_channels_mad=backbone.mad_backbone.out_channels, # MAD-only
+                in_channels_image=in_channels_image, # RGB-only
+                in_channels_mad=in_channels_mad, # MAD-only
                 args=args
             )
         elif use_snn:
-            yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
-            scale = getattr(args, 'snn_scale', 's')
-            backbone = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
+            if use_sdt:
+                backbone = SpikformerV3Extractor(args, height=height, width=width)
+            else:
+                yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
+                scale = getattr(args, 'snn_scale', 's')
+                backbone = SNNBackboneYAMLWrapper(args, height=height, width=width, yaml_path=yaml_path, scale=scale)
             head = YOLOXHead(num_classes=backbone.num_classes,
                              width=1.0,
                              strides=backbone.strides,
