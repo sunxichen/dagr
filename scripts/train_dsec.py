@@ -19,6 +19,9 @@ import argparse
 
 from torch_geometric.data import DataLoader
 from torch.utils.data import Subset
+# --- [ADDED] Mixed Precision Imports ---
+from torch.cuda.amp import autocast, GradScaler
+# ---------------------------------------
 
 from dagr.utils.logging import Checkpointer, set_up_logging_directory, log_hparams
 from dagr.utils.buffers import DetectionBuffer
@@ -56,6 +59,7 @@ def train(loader: DataLoader,
           scheduler: torch.optim.lr_scheduler.LambdaLR,
           optimizer: torch.optim.Optimizer,
           args: argparse.ArgumentParser,
+          scaler: GradScaler, # --- [ADDED] scaler arg
           run_name=""):
 
     model.train()
@@ -76,14 +80,20 @@ def train(loader: DataLoader,
         data = data.cuda(non_blocking=True)
         data = format_data(data)
 
-        model_outputs = model(data)
+        # --- [MODIFIED] AMP Autocast Context ---
+        with autocast():
+            model_outputs = model(data)
 
-        loss_dict = {k: v for k, v in model_outputs.items() if "loss" in k}
-        loss = loss_dict.pop("total_loss")
+            loss_dict = {k: v for k, v in model_outputs.items() if "loss" in k}
+            loss = loss_dict.pop("total_loss")
 
-        loss = loss / accum_steps
+            loss = loss / accum_steps
+        # ---------------------------------------
+        
         # torch.autograd.set_detect_anomaly(True)
-        loss.backward()
+        # --- [MODIFIED] Scaled Backward ---
+        scaler.scale(loss).backward()
+        # ----------------------------------
 
         # Debug: list parameters without gradients
         # if (not printed_unused_once) and getattr(args, 'debug_unused_params', False) and getattr(args, 'is_main_process', True):
@@ -108,9 +118,16 @@ def train(loader: DataLoader,
 
         step_in_accum += 1
         if step_in_accum == accum_steps:
+            # --- [MODIFIED] Unscale before clip ---
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_value_(model.parameters(), args.clip)
             fix_gradients(model)
-            optimizer.step()
+            
+            # --- [MODIFIED] Scaler Step ---
+            scaler.step(optimizer)
+            scaler.update()
+            # ------------------------------
+            
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             step_in_accum = 0
@@ -155,7 +172,11 @@ def run_test(loader: DataLoader,
         data = data.cuda()
         data = format_data(data)
 
-        detections, targets = model(data)
+        # --- [MODIFIED] Autocast Inference ---
+        with autocast():
+            detections, targets = model(data)
+        # -------------------------------------
+        
         if i % 10 == 0:
             torch.cuda.empty_cache()
 
@@ -316,6 +337,10 @@ if __name__ == '__main__':
     lr = args.l_r * np.sqrt(args.batch_size) / np.sqrt(nominal_batch_size)
     optimizer = torch.optim.AdamW(list(model.parameters()), lr=lr, weight_decay=args.weight_decay)
 
+    # --- [ADDED] GradScaler for AMP ---
+    scaler = GradScaler()
+    # ----------------------------------
+
     lr_func = LRSchedule(warmup_epochs=.3,
                          num_iters_per_epoch=effective_iters_per_epoch,
                          tot_num_epochs=args.tot_num_epochs)
@@ -361,7 +386,7 @@ if __name__ == '__main__':
     for epoch in range(0, args.tot_num_epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        mean_loss = train(train_loader, model, ema, lr_scheduler, optimizer, args, run_name=(wandb.run.name if args.is_main_process else ""))
+        mean_loss = train(train_loader, model, ema, lr_scheduler, optimizer, args, scaler=scaler, run_name=(wandb.run.name if args.is_main_process else ""))
         if args.is_main_process:
             try:
                 current_lr = lr_scheduler.get_last_lr()[-1]
@@ -393,4 +418,3 @@ if __name__ == '__main__':
 
     if args.distributed:
         dist.destroy_process_group()
-
