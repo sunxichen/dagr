@@ -84,6 +84,10 @@ def BASE_FLAGS():
                         help="Embedding dims list for SDT-V3 (len>=4, e.g., 128 256 512 640)")
     parser.add_argument("--sdt_norm", type=float, default=argparse.SUPPRESS,
                         help="Spike normalization (lens) used by SDT-V3 (default: 4.0)")
+    parser.add_argument("--sdt_sr_ratio", type=int, default=1, 
+                        help="Spatial-Reduction ratio / Value expansion ratio for SDT-V3 attention (default: 1). Checkpoints often use 4.")
+    parser.add_argument("--load_pretrained_weight", default=None, type=str,
+                        help="Path to pretrained .pth weights for SDT-V3 backbone (classification head will be skipped)")
 
     return parser
 

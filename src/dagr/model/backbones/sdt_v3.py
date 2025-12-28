@@ -301,6 +301,7 @@ class SpikformerV3Extractor(nn.Module):
         attn_drop_rate=0.0,
         drop_path_rate=0.1,
         choice="base",
+        pretrained_weight=None,
     ):
         super().__init__()
         self.height = int(height)
@@ -311,6 +312,7 @@ class SpikformerV3Extractor(nn.Module):
         self.use_checkpointing = bool(getattr(args, "use_checkpointing", False) or getattr(args, "sdt_checkpoint", True))
         self.in_channels = int(getattr(args, "sdt_in_channels", getattr(args, "in_channels", 2)))
         self.spike_norm = float(getattr(args, "sdt_norm", DEFAULT_SPIKE_NORM))
+        self.pretrained_weight = pretrained_weight or getattr(args, "load_pretrained_weight", None)
 
         # Allow overriding from args if not provided explicitly
         if depths is None:
@@ -335,6 +337,9 @@ class SpikformerV3Extractor(nn.Module):
         # dpr only applies to the Transformer stage (Stage 3), which has self.depths[2] blocks
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, self.depths[2])]
 
+
+        sr_ratio = getattr(args, "sdt_sr_ratio", sr_ratio)
+
         # --- Stage 1 (Output Stride 4) ---
         # 1_1: intermediate (Stride 2)
         self.downsample1_1 = MS_DownSampling(
@@ -346,7 +351,7 @@ class SpikformerV3Extractor(nn.Module):
             first_layer=True,
             spike_norm=self.spike_norm,
         )
-        # Fixed 1 layer for intermediate 1_1
+
         self.ConvBlock1_1 = nn.ModuleList([MS_ConvBlock(dim=embed_dim[0] // 2, mlp_ratio=mlp_ratio, spike_norm=self.spike_norm)])
 
         # 1_2: Output (Stride 4)
@@ -359,7 +364,7 @@ class SpikformerV3Extractor(nn.Module):
             first_layer=False,
             spike_norm=self.spike_norm,
         )
-        # [MODIFIED] Use self.depths[0]
+
         self.ConvBlock1_2 = nn.ModuleList([
             MS_ConvBlock(dim=embed_dim[0], mlp_ratio=mlp_ratio, spike_norm=self.spike_norm)
             for _ in range(self.depths[0])
@@ -377,7 +382,7 @@ class SpikformerV3Extractor(nn.Module):
         )
         # Fixed 1 layer for 2_1
         self.ConvBlock2_1 = nn.ModuleList([MS_ConvBlock(dim=embed_dim[1], mlp_ratio=mlp_ratio, spike_norm=self.spike_norm)])
-        # [MODIFIED] Use self.depths[1] for 2_2
+
         self.ConvBlock2_2 = nn.ModuleList([
             MS_ConvBlock(dim=embed_dim[1], mlp_ratio=mlp_ratio, spike_norm=self.spike_norm)
             for _ in range(self.depths[1])
@@ -393,7 +398,7 @@ class SpikformerV3Extractor(nn.Module):
             first_layer=False,
             spike_norm=self.spike_norm,
         )
-        # [MODIFIED] Use self.depths[2]
+
         self.block3 = nn.ModuleList(
             [
                 MS_Block(
@@ -424,7 +429,7 @@ class SpikformerV3Extractor(nn.Module):
             first_layer=False,
             spike_norm=self.spike_norm,
         )
-        # [MODIFIED] Use self.depths[3]
+
         self.ConvBlock4 = nn.ModuleList([
             MS_ConvBlock(dim=embed_dim[3], mlp_ratio=mlp_ratio, spike_norm=self.spike_norm)
             for _ in range(self.depths[3])
@@ -436,6 +441,10 @@ class SpikformerV3Extractor(nn.Module):
         self.use_image = False
         self.is_snn = True
         self.num_classes = getattr(args, "num_classes", getattr(args, "n_classes", 2))
+
+        # Load pretrained weights if provided
+        if self.pretrained_weight:
+            self._load_pretrained_weights(self.pretrained_weight)
 
     def get_output_sizes(self):
         sizes = []
@@ -551,3 +560,40 @@ class SpikformerV3Extractor(nn.Module):
         p5 = stage4.mean(dim=0)  # (B, C4, H/32, W/32)
 
         return [p3, p4, p5]
+
+    def _load_pretrained_weights(self, weight_path: str):
+        try:
+            ckpt = torch.load(weight_path, map_location="cpu")
+            if isinstance(ckpt, dict):
+                if "model" in ckpt:
+                    ckpt = ckpt["model"]
+                elif "state_dict" in ckpt:
+                    ckpt = ckpt["state_dict"]
+
+            if not isinstance(ckpt, dict):
+                logging.warning(f"[SpikformerV3Extractor] Unexpected checkpoint format at {weight_path}, skip loading.")
+                return
+
+            # 1. 过滤掉分类头 (head)
+            filtered = {k: v for k, v in ckpt.items() if not k.startswith("head")}
+
+            # 2. 处理通道数不匹配的输入层权重
+            mismatch_keys = ["downsample1_1.encode_conv.weight", "patch_embed.proj.weight"]
+            
+            for key in mismatch_keys:
+                if key in filtered:
+                    # 检查输入通道维 (dim 1) 是否匹配
+                    if filtered[key].shape[1] != self.in_channels:
+                        logging.warning(
+                            f"[SpikformerV3Extractor] Removing mismatch key '{key}' "
+                            f"(ckpt input={filtered[key].shape[1]}, model input={self.in_channels})"
+                        )
+                        del filtered[key]
+
+            # 3. 加载剩余匹配的权重
+            missing, unexpected = self.load_state_dict(filtered, strict=False)
+            logging.info(f"[SpikformerV3Extractor] Loaded pretrained weights from {weight_path}. "
+                         f"Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+        
+        except Exception as exc:
+            logging.warning(f"[SpikformerV3Extractor] Failed to load pretrained weights from {weight_path}: {exc}")

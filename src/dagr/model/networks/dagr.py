@@ -250,7 +250,7 @@ class DAGR(YOLOX):
             )
         elif use_snn:
             if use_sdt:
-                backbone = SpikformerV3Extractor(args, height=height, width=width)
+                backbone = SpikformerV3Extractor(args, height=height, width=width, pretrained_weight=getattr(args, "load_pretrained_weight", None))
             else:
                 yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
                 scale = getattr(args, 'snn_scale', 's')

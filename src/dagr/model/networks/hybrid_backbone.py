@@ -51,10 +51,10 @@ class HybridBackbone(nn.Module):
 
         # Event backbone (temporal features)
         if self.use_sdt_v3:
-            self.snn = SpikformerV3Extractor(args, height=height, width=width)
+            self.snn = SpikformerV3Extractor(args, height=height, width=width, pretrained_weight=getattr(args, "load_pretrained_weight", None))
             evt_channels = list(self.snn.out_channels)
             # Align image scales to strides [8,16,32] -> RGB c3,c4,c5
-            rgb_fuse_channels = [s, c4_ch, c5_ch]
+            rgb_fuse_channels = [c3_ch, c4_ch, c5_ch]
             self.strides = [8, 16, 32]
             self.out_channels = rgb_fuse_channels
         else:

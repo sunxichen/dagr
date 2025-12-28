@@ -135,7 +135,10 @@ def train(loader: DataLoader,
             if getattr(args, 'is_main_process', True):
                 ema.update(model.module if getattr(args, 'distributed', False) else model)
 
-        training_logs = {f"training/loss/{k}": v for k, v in loss_dict.items()}
+        training_logs = {
+            f"training/loss/{k}": v.item() if isinstance(v, torch.Tensor) else v 
+            for k, v in loss_dict.items()
+        }
         if getattr(args, 'is_main_process', True):
             try:
                 current_lr = scheduler.get_last_lr()[-1]
@@ -147,8 +150,14 @@ def train(loader: DataLoader,
         total_loss_sum += float(loss.item()) * accum_steps
         num_steps += 1 if step_in_accum == 0 else 0
 
+        # 清理引用，释放显存
+        del loss, loss_dict, model_outputs
+        del data
+        
         # if torch.cuda.is_available():
         #     torch.cuda.empty_cache()
+
+    # return mean loss for console print
 
     # return mean loss for console print
     mean_loss = total_loss_sum / max(1, num_steps)

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# GPU selection (optional)
+# ------------------------------------------------------------------------------
+# 1. 基础环境与路径配置
+# ------------------------------------------------------------------------------
+
+# GPU 选择 (可选)
 # export CUDA_VISIBLE_DEVICES=0
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export DISTRIBUTED=0
@@ -9,55 +13,80 @@ export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export WANDB_MODE=disabled
 export NO_EVAL=${NO_EVAL:-0}
 
-# Paths
+# Python 与 启动命令
 PYTHON=python
 TORCHRUN=torchrun
 TRAIN_SCRIPT=scripts/train_dsec.py
 
-# Output
+# 输出路径配置
 OUTPUT_DIR=/root/autodl-tmp/runs/dsec_sdtv3
 EXP_NAME=sdtv3_s_fasttrend
 
-# SDT-V3 backbone config (event-only)
+# ------------------------------------------------------------------------------
+# 2. 模型配置切换区 (根据需求取消注释其中一个板块)
+# ------------------------------------------------------------------------------
+
+# SDT-V3 基础配置 (所有模式通用)
 BACKBONE_TYPE=sdtv3
 SDT_T=4
-SDT_IN_CHANNELS=2          # polarity events
-# SDT_EMBED_DIMS="128 256 512 640"
-# SDT_DEPTHS="2 2 6 2"
-# Reduce model size to fit in 24GB VRAM
-SDT_EMBED_DIMS="64 128 256 512"
-SDT_DEPTHS="2 2 2 2"       # Reduced depths
-SDT_NUM_HEADS=8
+SDT_IN_CHANNELS=2          # 事件极性通道数
 SDT_MLP_RATIO=4.0
 SDT_NORM=4.0
-SDT_CHECKPOINT=1
+SDT_CHECKPOINT=1           # 开启 Checkpointing 以节省显存
 
-# Hyperparameters (per-GPU semantics)
+# --- [选项 1: 加载 19M 预训练权重] (默认不开启) ---
+# 说明: 必须严格匹配权重的特殊结构 (SR=4, 最后一层Dim=360)
+# ----------------------------------------------------------
+# PRETRAINED_WEIGHT="/root/sdtv3_ckpts/V3_19.0M_1x4.pth"
+# SDT_EMBED_DIMS="64 128 256 360"  # 注意: 预训练权重的最后一层是特殊的 360
+# SDT_DEPTHS="2 2 6 2"            
+# SDT_NUM_HEADS=8
+# SDT_SR_RATIO=4                  # 预训练权重使用了 4 倍膨胀
+
+# --- [选项 2: 从头训练 (标准结构)] ---
+# 说明: 使用标准的 512 维度，硬件效率更高；不加载权重
+# ----------------------------------------------------------
+PRETRAINED_WEIGHT=""            # 留空表示不加载预训练权重
+SDT_EMBED_DIMS="64 128 256 512" # 标准配置，回归 2 的幂次方，更适合硬件
+SDT_DEPTHS="2 2 6 2"
+SDT_NUM_HEADS=8
+SDT_SR_RATIO=4                  # 保持 4 以获得较好的表征能力
+
+# ------------------------------------------------------------------------------
+# 3. 训练超参数与数据集
+# ------------------------------------------------------------------------------
+
+# 训练参数 (per-GPU)
 BATCH_SIZE=1
 EPOCHS=801
 LR=0.0002
 WEIGHT_DECAY=0.00001
 
-# Dataset settings (adjust DATASET_DIR if needed)
+# 数据集设置
 DATASET=dsec
 EXP_TREND=fast           # fast | mid | full
 DATASET_DIR=/root/autodl-tmp
 
-# (Optional) MAD flow checkpoint not used in SDT-only run
-
-# Create log file with timestamp
-LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}_$(date +%Y%m%d_%H%M%S).log"
+# 日志文件
 mkdir -p "$OUTPUT_DIR"
+LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}_$(date +%Y%m%d_%H%M%S).log"
 
 echo "Training log will be saved to: $LOG_FILE"
 echo "Starting training..."
+echo "Mode: PRETRAINED_WEIGHT='${PRETRAINED_WEIGHT}'"
+echo "Dims: ${SDT_EMBED_DIMS}"
 
-# Optional flags
+# ------------------------------------------------------------------------------
+# 4. 参数组装与启动
+# ------------------------------------------------------------------------------
+
+# 可选标志处理
 NO_EVAL_FLAG=()
 if [[ "${NO_EVAL}" -eq 1 ]]; then
   NO_EVAL_FLAG+=(--no_eval)
 fi
 
+# 组装通用参数
 COMMON_ARGS=(
   --config config/dagr-s-dsec.yaml
   --dataset "$DATASET"
@@ -77,19 +106,28 @@ COMMON_ARGS=(
   --sdt_num_heads "$SDT_NUM_HEADS"
   --sdt_mlp_ratio "$SDT_MLP_RATIO"
   --sdt_norm "$SDT_NORM"
+  --sdt_sr_ratio "$SDT_SR_RATIO"
   --dataset_directory "$DATASET_DIR"
-  --use_checkpointing
   "${NO_EVAL_FLAG[@]}"
 )
 
-# Add SDT checkpoint flag if enabled
+# 添加 Checkpoint 标志
 if [[ "${SDT_CHECKPOINT:-0}" -eq 1 ]]; then
-  COMMON_ARGS+=(--sdt_checkpoint)
+  COMMON_ARGS+=(--use_checkpointing) # 注意: dagr 代码通常使用 --use_checkpointing 来控制
 fi
 
-# If DISTRIBUTED=1, run with torchrun and enable --distributed
+# 仅当 PRETRAINED_WEIGHT 非空时，才添加加载参数
+if [[ -n "${PRETRAINED_WEIGHT}" ]]; then
+  COMMON_ARGS+=(--load_pretrained_weight "$PRETRAINED_WEIGHT")
+fi
+
+# ------------------------------------------------------------------------------
+# 5. 执行训练
+# ------------------------------------------------------------------------------
+
+# 分布式启动 (DISTRIBUTED=1)
 if [[ "${DISTRIBUTED:-0}" -eq 1 ]]; then
-  # Infer NUM_GPUS from CUDA_VISIBLE_DEVICES if not provided
+  # 自动推断 GPU 数量
   if [[ -z "${NUM_GPUS:-}" ]]; then
     if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
       IFS=',' read -r -a DEV_ARR <<< "$CUDA_VISIBLE_DEVICES"
@@ -102,10 +140,10 @@ if [[ "${DISTRIBUTED:-0}" -eq 1 ]]; then
     --distributed \
     "${COMMON_ARGS[@]}" \
     2>&1 | tee "$LOG_FILE"
+
+# 单卡启动
 else
   $PYTHON "$TRAIN_SCRIPT" \
     "${COMMON_ARGS[@]}" \
     2>&1 | tee "$LOG_FILE"
 fi
-
-# If your FLAGS require --dataset_directory, ensure DATASET_DIR is set correctly.
