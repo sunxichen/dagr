@@ -463,14 +463,37 @@ class SpikformerV3Extractor(nn.Module):
         else:
             b = torch.zeros((data.pos.shape[0],), dtype=torch.long, device=device)
 
+        # data.pos contains NORMALIZED coordinates [0, 1], not pixel coordinates!
+        # Must scale to pixel coordinates.
         x_norm = data.pos[:, 0]
         y_norm = data.pos[:, 1]
-        x_pix = torch.clamp((x_norm * (width - 1)).round().long(), 0, width - 1)
-        y_pix = torch.clamp((y_norm * (height - 1)).round().long(), 0, height - 1)
+        
+        x_pix = (x_norm * (width - 1)).long()
+        y_pix = (y_norm * (height - 1)).long()
+        x_pix = torch.clamp(x_pix, 0, width - 1)
+        y_pix = torch.clamp(y_pix, 0, height - 1)
 
         p = (data.x[:, 0] > 0).long()
         frames.index_put_((b, p, y_pix, x_pix), torch.ones_like(p, dtype=frames.dtype), accumulate=True)
+        
+        # Log raw event statistics occasionally
+        if torch.rand(1).item() < 0.01:
+            print(f"[SDT Input Raw] Max events/pixel: {frames.max().item():.1f}, Mean: {frames.mean().item():.6f}", flush=True)
+
+        # Apply log1p normalization with reference 100 (restored from working version)
+        # Training: max~160 events → log1p(160)/log1p(100)≈1.15→clamp to 1.0 (acceptable)
+        # Eval: max~700 events → log1p(700)/log1p(100)≈1.95→clamp to 1.0 (some saturation, but manageable)
+        # This is the reference that previously showed non-zero mAP (Epoch 0, 2)
+        # log1p(1)/log1p(100)≈0.01, log1p(10)/log1p(100)≈0.23, log1p(100)/log1p(100)=1.0
+        log_scale = torch.log1p(torch.tensor(100.0, device=frames.device, dtype=frames.dtype))
+        frames = torch.log1p(frames) / log_scale
         frames.clamp_(max=1.0)
+        
+        # Log normalized frame statistics occasionally
+        if torch.rand(1).item() < 0.01:
+            sat_pct = (frames >= 1.0).float().mean().item() * 100
+            print(f"[SDT Input Norm] Max: {frames.max().item():.4f}, Mean: {frames.mean().item():.6f}, Saturated: {sat_pct:.2f}%", flush=True)
+        
         return frames.unsqueeze(0)  # [T=1, B, 2, H, W]
 
     def _maybe_checkpoint(self, module, *tensors):
@@ -558,6 +581,13 @@ class SpikformerV3Extractor(nn.Module):
         p3 = stage2.mean(dim=0)  # (B, C2, H/8, W/8)
         p4 = stage3.mean(dim=0)  # (B, C3, H/16, W/16)
         p5 = stage4.mean(dim=0)  # (B, C4, H/32, W/32)
+
+        # --- Debug: Check feature statistics ---
+        if torch.rand(1).item() < 0.005:
+            print(f"[SDT Features] p3: mean={p3.mean().item():.4f}, std={p3.std().item():.4f}, max={p3.max().item():.4f}", flush=True)
+            print(f"[SDT Features] p4: mean={p4.mean().item():.4f}, std={p4.std().item():.4f}, max={p4.max().item():.4f}", flush=True)
+            print(f"[SDT Features] p5: mean={p5.mean().item():.4f}, std={p5.std().item():.4f}, max={p5.max().item():.4f}", flush=True)
+        # --------------------------------------
 
         return [p3, p4, p5]
 

@@ -21,6 +21,12 @@ from torch_geometric.data import DataLoader
 from torch.utils.data import Subset
 # --- [ADDED] Mixed Precision Imports ---
 from torch.cuda.amp import autocast, GradScaler
+
+class DummyScaler:
+    def scale(self, loss): return loss
+    def step(self, optimizer): optimizer.step()
+    def update(self): pass
+    def unscale_(self, optimizer): pass
 # ---------------------------------------
 
 from dagr.utils.logging import Checkpointer, set_up_logging_directory, log_hparams
@@ -79,9 +85,23 @@ def train(loader: DataLoader,
     for i, data in enumerate(iterator):
         data = data.cuda(non_blocking=True)
         data = format_data(data)
+        
+        # --- Debug: Check training bbox on first iter ---
+        if i == 0 and getattr(args, 'is_main_process', True):
+            if hasattr(data, 'bbox') and data.bbox is not None:
+                print(f"[Debug Train] bbox shape: {data.bbox.shape}", flush=True)
+                if len(data.bbox) > 0:
+                    print(f"[Debug Train] bbox sample (xywh): {data.bbox[0]}", flush=True)
+                    print(f"[Debug Train] bbox range: x=[{data.bbox[:, 0].min():.1f}, {data.bbox[:, 0].max():.1f}], "
+                          f"y=[{data.bbox[:, 1].min():.1f}, {data.bbox[:, 1].max():.1f}], "
+                          f"w=[{data.bbox[:, 2].min():.1f}, {data.bbox[:, 2].max():.1f}], "
+                          f"h=[{data.bbox[:, 3].min():.1f}, {data.bbox[:, 3].max():.1f}]", flush=True)
+            else:
+                print("[Debug Train] WARNING: No bbox in data!", flush=True)
+        # ------------------------------------------------
 
         # --- [MODIFIED] AMP Autocast Context ---
-        with autocast():
+        with autocast(enabled=False): # Disable AMP
             model_outputs = model(data)
 
             loss_dict = {k: v for k, v in model_outputs.items() if "loss" in k}
@@ -149,6 +169,10 @@ def train(loader: DataLoader,
         # accumulate for epoch mean
         total_loss_sum += float(loss.item()) * accum_steps
         num_steps += 1 if step_in_accum == 0 else 0
+        
+        if i % 50 == 0 and getattr(args, 'is_main_process', True):
+             loss_str = ", ".join([f"{k}={v:.4f}" for k, v in training_logs.items()])
+             print(f"[Train][Iter {i}] {loss_str}", flush=True)
 
         # 清理引用，释放显存
         del loss, loss_dict, model_outputs
@@ -182,8 +206,23 @@ def run_test(loader: DataLoader,
         data = format_data(data)
 
         # --- [MODIFIED] Autocast Inference ---
-        with autocast():
+        with autocast(enabled=False): # Disable AMP
             detections, targets = model(data)
+        
+        # --- Debug: Check raw output stats ---
+        if i == 0:
+            if len(detections) > 0:
+                print(f"[Debug] Detections[0]: boxes={detections[0]['boxes'].shape}, scores={detections[0]['scores'].shape}", flush=True)
+                if len(detections[0]['scores']) > 0:
+                    print(f"[Debug] Max score: {detections[0]['scores'].max().item():.4f}, Min score: {detections[0]['scores'].min().item():.4f}", flush=True)
+            else:
+                print("[Debug] Detections list is empty!", flush=True)
+            
+            # Debug: Check ground truth boxes
+            if len(targets) > 0 and len(targets[0]['boxes']) > 0:
+                print(f"[Debug] GT boxes[0]: {targets[0]['boxes'].shape}, sample: {targets[0]['boxes'][0]}", flush=True)
+            else:
+                print("[Debug] WARNING: No ground truth boxes found!", flush=True)
         # -------------------------------------
         
         if i % 10 == 0:
@@ -254,7 +293,7 @@ if __name__ == '__main__':
     #                     min_bbox_diag=15, min_bbox_height=10)
     # --- 修正：强制 scale=4 以减少 VRAM 占用 ---
     # 注意：这仅用于 24GB 显存的 OOM 测试
-    forced_scale = 4
+    forced_scale = 1
     print(f"\033[93mWARNING: Forcing data scale to {forced_scale} to fit in 24GB VRAM.\033[0m")
     
     train_dataset = DSEC(root=dataset_path, split="train", transform=augmentations.transform_training, debug=False,
@@ -347,7 +386,8 @@ if __name__ == '__main__':
     optimizer = torch.optim.AdamW(list(model.parameters()), lr=lr, weight_decay=args.weight_decay)
 
     # --- [ADDED] GradScaler for AMP ---
-    scaler = GradScaler()
+    # scaler = GradScaler()
+    scaler = DummyScaler() # Disable AMP to avoid numerical errors
     # ----------------------------------
 
     lr_func = LRSchedule(warmup_epochs=.3,

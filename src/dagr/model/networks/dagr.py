@@ -213,7 +213,7 @@ class HybridHeadV2(YOLOXHead):
 
 class DAGR(YOLOX):
     def __init__(self, args, height, width):
-        self.conf_threshold = 0.001
+        self.conf_threshold = 0.0001
         self.nms_threshold = 0.65
 
         self.height = height
@@ -259,6 +259,10 @@ class DAGR(YOLOX):
                              width=1.0,
                              strides=backbone.strides,
                              in_channels=backbone.out_channels)
+            
+            # --- [ADDED] Initialize biases for stability ---
+            head.initialize_biases(1e-2)
+            # -----------------------------------------------
         else:
             backbone = Net(args, height=height, width=width)
             head = GNNHead(num_classes=backbone.num_classes,
