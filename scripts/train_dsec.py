@@ -293,7 +293,7 @@ if __name__ == '__main__':
     #                     min_bbox_diag=15, min_bbox_height=10)
     # --- 修正：强制 scale=4 以减少 VRAM 占用 ---
     # 注意：这仅用于 24GB 显存的 OOM 测试
-    forced_scale = 1
+    forced_scale = 2
     print(f"\033[93mWARNING: Forcing data scale to {forced_scale} to fit in 24GB VRAM.\033[0m")
     
     train_dataset = DSEC(root=dataset_path, split="train", transform=augmentations.transform_training, debug=False,

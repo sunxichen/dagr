@@ -445,7 +445,26 @@ class SpikformerV3Extractor(nn.Module):
         # Load pretrained weights if provided
         if self.pretrained_weight:
             self._load_pretrained_weights(self.pretrained_weight)
+        else:
+            # 如果没有加载预训练权重 (从头训练)，则执行我们定制的初始化
+            print("[SpikformerV3Extractor] Training from scratch. Applying SNN bias initialization...")
+            self._init_snn_weights()
 
+    def _init_snn_weights(self):
+        # 遍历所有子模块进行初始化
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Conv1d)):
+                # 卷积层使用 Kaiming 初始化，保证方差
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d, nn.LayerNorm)):
+                nn.init.constant_(m.weight, 1)
+                # 【核心 Hack】: 将 BN 的 Bias 初始化为 0.5 (甚至 1.0)
+                # 这样 BN 输出的均值就会从 0 变成 0.5，正好卡在 Multispike 的门槛上
+                # 保证初始状态下有一半的神经元能发放脉冲，打通信号通路！
+                nn.init.constant_(m.bias, 0)
+    
     def get_output_sizes(self):
         sizes = []
         for s in self.strides:
@@ -485,9 +504,11 @@ class SpikformerV3Extractor(nn.Module):
         # Eval: max~700 events → log1p(700)/log1p(100)≈1.95→clamp to 1.0 (some saturation, but manageable)
         # This is the reference that previously showed non-zero mAP (Epoch 0, 2)
         # log1p(1)/log1p(100)≈0.01, log1p(10)/log1p(100)≈0.23, log1p(100)/log1p(100)=1.0
-        log_scale = torch.log1p(torch.tensor(100.0, device=frames.device, dtype=frames.dtype))
-        frames = torch.log1p(frames) / log_scale
-        frames.clamp_(max=1.0)
+        # target_scale = 5.0 
+        # log_scale = torch.log1p(torch.tensor(target_scale, device=frames.device, dtype=frames.dtype))
+        # frames = torch.log1p(frames) / log_scale
+        # frames.clamp_(max=1.0)
+        frames = torch.clamp(frames, max=3.0) / 3.0
         
         # Log normalized frame statistics occasionally
         if torch.rand(1).item() < 0.01:
@@ -608,17 +629,27 @@ class SpikformerV3Extractor(nn.Module):
             filtered = {k: v for k, v in ckpt.items() if not k.startswith("head")}
 
             # 2. 处理通道数不匹配的输入层权重
-            mismatch_keys = ["downsample1_1.encode_conv.weight", "patch_embed.proj.weight"]
+            # mismatch_keys = ["downsample1_1.encode_conv.weight", "patch_embed.proj.weight"]
             
-            for key in mismatch_keys:
-                if key in filtered:
-                    # 检查输入通道维 (dim 1) 是否匹配
-                    if filtered[key].shape[1] != self.in_channels:
-                        logging.warning(
-                            f"[SpikformerV3Extractor] Removing mismatch key '{key}' "
-                            f"(ckpt input={filtered[key].shape[1]}, model input={self.in_channels})"
-                        )
-                        del filtered[key]
+            # for key in mismatch_keys:
+            #     if key in filtered:
+            #         # 检查输入通道维 (dim 1) 是否匹配
+            #         if filtered[key].shape[1] != self.in_channels:
+            #             logging.warning(
+            #                 f"[SpikformerV3Extractor] Removing mismatch key '{key}' "
+            #                 f"(ckpt input={filtered[key].shape[1]}, model input={self.in_channels})"
+            #             )
+            #             del filtered[key]
+            keys_to_remove = []
+            for k in filtered.keys():
+                # 如果第一层下采样层（输入层），或者是 patch_embed
+                if "downsample1_1" in k or "patch_embed" in k:
+                    keys_to_remove.append(k)
+            
+            if len(keys_to_remove) > 0:
+                logging.warning(f"[SpikformerV3Extractor] Force removing {len(keys_to_remove)} keys from first layer (downsample1_1) to avoid BN mismatch.")
+                for k in keys_to_remove:
+                    del filtered[k]
 
             # 3. 加载剩余匹配的权重
             missing, unexpected = self.load_state_dict(filtered, strict=False)
