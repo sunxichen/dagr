@@ -41,8 +41,12 @@ class HybridHeadV2(YOLOXHead):
         
         self.image_head = YOLOXHead(num_classes, width=1.0, strides=strides, in_channels=in_channels_image, act=act, depthwise=depthwise)
         
-        
-        self.mad_head = YOLOXHead(num_classes, width=1.0, strides=strides, in_channels=in_channels_mad, act=act, depthwise=depthwise)
+        # 2. MAD Head (仅在 in_channels_mad 不为 None 时创建)
+        self.use_mad = in_channels_mad is not None
+        if self.use_mad:
+            self.mad_head = YOLOXHead(num_classes, width=1.0, strides=strides, in_channels=in_channels_mad, act=act, depthwise=depthwise)
+        else:
+            self.mad_head = None
 
         # --- 集成 Checkpointing 标志 ---
         self.use_checkpointing = getattr(args, 'use_checkpointing', False) if args else False
@@ -51,7 +55,8 @@ class HybridHeadV2(YOLOXHead):
         self.use_l1 = False 
         self.fused_head.use_l1 = False
         self.image_head.use_l1 = False
-        self.mad_head.use_l1 = False
+        if self.mad_head is not None:
+            self.mad_head.use_l1 = False
 
     def _get_raw_outputs(self, head_instance, xin_list):
         """
@@ -93,8 +98,8 @@ class HybridHeadV2(YOLOXHead):
                 self._get_raw_outputs, self.image_head, image_feats, use_reentrant=False
             )
             
-            # 3. Get MAD logits (with checkpointing, if available)
-            if mad_feats is not None:
+            # 3. Get MAD logits (with checkpointing, if available and enabled)
+            if self.use_mad and mad_feats is not None and self.mad_head is not None:
                 mad_cls, mad_reg, mad_obj = activation_checkpoint(
                     self._get_raw_outputs, self.mad_head, mad_feats, use_reentrant=False
                 )
@@ -110,11 +115,11 @@ class HybridHeadV2(YOLOXHead):
             # 2. Get Image logits
             image_cls, image_reg, image_obj = self._get_raw_outputs(self.image_head, image_feats)
 
-            # 3. Get MAD logits (仅在训练时获取)
-            if self.training and mad_feats is not None:
+            # 3. Get MAD logits (仅在训练时获取，且 MAD 分支启用时)
+            if self.use_mad and self.training and mad_feats is not None and self.mad_head is not None:
                 mad_cls, mad_reg, mad_obj = self._get_raw_outputs(self.mad_head, mad_feats)
             else:
-                # 推理时或 MAD 分支失败时，创建零张量
+                # 推理时、MAD 分支禁用或 MAD 分支失败时，创建零张量
                 mad_cls = [torch.zeros_like(f) for f in fused_cls]
                 mad_reg = [torch.zeros_like(f) for f in fused_reg]
                 mad_obj = [torch.zeros_like(f) for f in fused_obj]
@@ -124,13 +129,13 @@ class HybridHeadV2(YOLOXHead):
         # 模仿 GNNHead 的逻辑
         final_cls_outputs, final_reg_outputs, final_obj_outputs = [], [], []
         for k in range(self.num_scales):
-            # MAD 分支只在训练时参与相加
-            if self.training:
+            # MAD 分支只在训练时且启用时参与相加
+            if self.training and self.use_mad:
                 final_cls_outputs.append(fused_cls[k] + image_cls[k].detach() + mad_cls[k].detach())
                 final_reg_outputs.append(fused_reg[k] + image_reg[k].detach() + mad_reg[k].detach())
                 final_obj_outputs.append(fused_obj[k] + image_obj[k].detach() + mad_obj[k].detach())
             else:
-                # 推理时：只融合 Fused 和 Image
+                # 推理时或 MAD 禁用时：只融合 Fused 和 Image
                 final_cls_outputs.append(fused_cls[k] + image_cls[k].detach())
                 final_reg_outputs.append(fused_reg[k] + image_reg[k].detach())
                 final_obj_outputs.append(fused_obj[k] + image_obj[k].detach())
@@ -226,31 +231,55 @@ class DAGR(YOLOX):
         use_image = hasattr(args, 'use_image') and getattr(args, 'use_image')
         print(f"Debug: use_image: {use_image}")
 
+        use_mad = not getattr(args, 'no_mad', False)
+        if use_image and not use_mad:
+            print(f"Debug: --no_mad is set. MAD branch will be disabled.")
+
         if use_snn and getattr(args, 'use_image', False) and HybridBackbone is not None:
 
-            print(f"Debug: running with 3-branch hybrid backbone (Fused, RGB, MAD)")
+            if use_mad:
+                print(f"Debug: running with 3-branch hybrid backbone (Fused, RGB, MAD)")
+            else:
+                print(f"Debug: running with 2-branch hybrid backbone (Fused, RGB) - MAD disabled")
             backbone = HybridBackbone(args, height=height, width=width)
 
             # Align channel lists with the active backbone (SNN vs SDT-V3)
             if getattr(backbone, 'use_sdt_v3', False):
                 in_channels_image = backbone.out_channels  # [c3, c4, c5]
-                in_channels_mad = list(getattr(backbone.mad_backbone, 'out_channels', []))[-backbone.num_scales:]
+                if use_mad and hasattr(backbone, 'mad_backbone') and backbone.mad_backbone is not None:
+                    in_channels_mad = list(getattr(backbone.mad_backbone, 'out_channels', []))[-backbone.num_scales:]
+                else:
+                    in_channels_mad = None
             else:
                 rgb_all_channels = backbone.rgb.feature_channels + backbone.rgb.output_channels
                 in_channels_image = rgb_all_channels
-                in_channels_mad = backbone.mad_backbone.out_channels
+                if use_mad and hasattr(backbone, 'mad_backbone') and backbone.mad_backbone is not None:
+                    in_channels_mad = backbone.mad_backbone.out_channels
+                else:
+                    in_channels_mad = None
 
             head = HybridHeadV2(
                 num_classes=backbone.num_classes,
                 strides=backbone.strides,
                 in_channels_fused=backbone.out_channels,     # SNN-fused
                 in_channels_image=in_channels_image, # RGB-only
-                in_channels_mad=in_channels_mad, # MAD-only
+                in_channels_mad=in_channels_mad, # MAD-only (None if disabled)
                 args=args
             )
         elif use_snn:
             if use_sdt:
-                backbone = SpikformerV3Extractor(args, height=height, width=width, pretrained_weight=getattr(args, "load_pretrained_weight", None))
+                # 创建原始 backbone（返回时序特征 [T, B, C, H, W]）
+                raw_backbone = SpikformerV3Extractor(args, height=height, width=width, pretrained_weight=getattr(args, "load_pretrained_weight", None))
+                
+                # 如果不使用融合层，用包装器包装（适配层会转换为 [B, C, H, W]）
+                if not use_image:
+                    from dagr.model.backbones.sdt_backbone_wrapper import SDTBackboneWrapper
+                    backbone = SDTBackboneWrapper(raw_backbone)
+                    print("[DAGR] Using SDTBackboneWrapper: backbone returns temporal features, adapter converts to spatial.")
+                else:
+                    # 使用融合层时，直接使用原始 backbone（返回时序特征给融合层处理）
+                    backbone = raw_backbone
+                    print("[DAGR] Using raw SDT backbone: returns temporal features for fusion layer.")
             else:
                 yaml_path = getattr(args, 'snn_yaml_path', 'dagr/src/dagr/cfg/snn_yolov8.yaml')
                 scale = getattr(args, 'snn_scale', 's')

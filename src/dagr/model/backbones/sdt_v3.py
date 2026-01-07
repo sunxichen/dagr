@@ -313,6 +313,8 @@ class SpikformerV3Extractor(nn.Module):
         self.in_channels = int(getattr(args, "sdt_in_channels", getattr(args, "in_channels", 2)))
         self.spike_norm = float(getattr(args, "sdt_norm", DEFAULT_SPIKE_NORM))
         self.pretrained_weight = pretrained_weight or getattr(args, "load_pretrained_weight", None)
+        # 控制是否返回时序维度（默认 True，返回 [T, B, C, H, W]）
+        self.return_temporal = bool(getattr(args, "sdt_return_temporal", True))
 
         # Allow overriding from args if not provided explicitly
         if depths is None:
@@ -570,9 +572,14 @@ class SpikformerV3Extractor(nn.Module):
         """
         Returns:
             list[Tensor]: [P3, P4, P5] where
-                - P3: stride 8, shape (B, C2, H/8, W/8)
-                - P4: stride 16, shape (B, C3, H/16, W/16)
-                - P5: stride 32, shape (B, C4, H/32, W/32)
+                - If return_temporal=True (default):
+                  - P3: stride 8, shape (T, B, C2, H/8, W/8)
+                  - P4: stride 16, shape (T, B, C3, H/16, W/16)
+                  - P5: stride 32, shape (T, B, C4, H/32, W/32)
+                - If return_temporal=False:
+                  - P3: stride 8, shape (B, C2, H/8, W/8)
+                  - P4: stride 16, shape (B, C3, H/16, W/16)
+                  - P5: stride 32, shape (B, C4, H/32, W/32)
         """
         if reset:
             functional.reset_net(self)
@@ -587,30 +594,44 @@ class SpikformerV3Extractor(nn.Module):
 
         x = self._maybe_checkpoint(self.downsample2, x)
         x = self._run_blocks(x, self.ConvBlock2_1)
-        stage2 = self._run_blocks(x, self.ConvBlock2_2)  # stride 8
+        stage2 = self._run_blocks(x, self.ConvBlock2_2)  # stride 8, [T, B, C2, H/8, W/8]
 
         x = self._maybe_checkpoint(self.downsample3, stage2)
         h3, w3 = x.shape[-2:]
         x_tokens = x.flatten(3)  # T,B,C,N
         x_tokens = self._run_blocks(x_tokens, self.block3)
-        stage3 = x_tokens.view(x.shape[0], x.shape[1], self.embed_dim[2], h3, w3)  # stride 16
+        stage3 = x_tokens.view(x.shape[0], x.shape[1], self.embed_dim[2], h3, w3)  # stride 16, [T, B, C3, H/16, W/16]
 
         stage4 = self._maybe_checkpoint(self.downsample4, stage3)
-        stage4 = self._run_blocks(stage4, self.ConvBlock4)  # stride 32
+        stage4 = self._run_blocks(stage4, self.ConvBlock4)  # stride 32, [T, B, C4, H/32, W/32]
 
-        # Collapse time for neck/head consumption
-        p3 = stage2.mean(dim=0)  # (B, C2, H/8, W/8)
-        p4 = stage3.mean(dim=0)  # (B, C3, H/16, W/16)
-        p5 = stage4.mean(dim=0)  # (B, C4, H/32, W/32)
-
-        # --- Debug: Check feature statistics ---
-        if torch.rand(1).item() < 0.005:
-            print(f"[SDT Features] p3: mean={p3.mean().item():.4f}, std={p3.std().item():.4f}, max={p3.max().item():.4f}", flush=True)
-            print(f"[SDT Features] p4: mean={p4.mean().item():.4f}, std={p4.std().item():.4f}, max={p4.max().item():.4f}", flush=True)
-            print(f"[SDT Features] p5: mean={p5.mean().item():.4f}, std={p5.std().item():.4f}, max={p5.max().item():.4f}", flush=True)
-        # --------------------------------------
-
-        return [p3, p4, p5]
+        # 根据 return_temporal 标志决定返回格式
+        if self.return_temporal:
+            # 返回时序特征 [T, B, C, H, W]，供融合层或适配层使用
+            # --- Debug: Check feature statistics ---
+            if torch.rand(1).item() < 0.005:
+                p3_mean = stage2.mean(dim=0)
+                p4_mean = stage3.mean(dim=0)
+                p5_mean = stage4.mean(dim=0)
+                print(f"[SDT Temporal Features] stage2: T={stage2.shape[0]}, mean={p3_mean.mean().item():.4f}, std={p3_mean.std().item():.4f}", flush=True)
+                print(f"[SDT Temporal Features] stage3: T={stage3.shape[0]}, mean={p4_mean.mean().item():.4f}, std={p4_mean.std().item():.4f}", flush=True)
+                print(f"[SDT Temporal Features] stage4: T={stage4.shape[0]}, mean={p5_mean.mean().item():.4f}, std={p5_mean.std().item():.4f}", flush=True)
+            # --------------------------------------
+            return [stage2, stage3, stage4]
+        else:
+            # 向后兼容：返回空间特征 [B, C, H, W]（旧行为）
+            p3 = stage2.mean(dim=0)  # (B, C2, H/8, W/8)
+            p4 = stage3.mean(dim=0)  # (B, C3, H/16, W/16)
+            p5 = stage4.mean(dim=0)  # (B, C4, H/32, W/32)
+            
+            # --- Debug: Check feature statistics ---
+            if torch.rand(1).item() < 0.005:
+                print(f"[SDT Features] p3: mean={p3.mean().item():.4f}, std={p3.std().item():.4f}, max={p3.max().item():.4f}", flush=True)
+                print(f"[SDT Features] p4: mean={p4.mean().item():.4f}, std={p4.std().item():.4f}, max={p4.max().item():.4f}", flush=True)
+                print(f"[SDT Features] p5: mean={p5.mean().item():.4f}, std={p5.std().item():.4f}, max={p5.max().item():.4f}", flush=True)
+            # --------------------------------------
+            
+            return [p3, p4, p5]
 
     def _load_pretrained_weights(self, weight_path: str):
         try:

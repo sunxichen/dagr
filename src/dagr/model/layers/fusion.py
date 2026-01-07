@@ -87,6 +87,13 @@ class SpikeCAFR(nn.Module):
     def forward(self, rgb: torch.Tensor, evt: torch.Tensor) -> torch.Tensor:
         # 预投射
         rgb = self.bn_rgb_in(self.conv_rgb_in(rgb))
+        
+        # 处理事件特征：支持4维 [B,C,H,W] 和5维 [T,B,C,H,W] 输入
+        if evt.dim() == 4:
+            # 如果是4维输入（向后兼容），需要添加时间维度
+            evt = evt.unsqueeze(0)  # [B,C,H,W] -> [1,B,C,H,W]
+        # 现在 SDT-V3 默认返回 5维 [T,B,C,H,W]，直接使用
+        
         T, B, C_evt, H, W = evt.shape
         evt = self.bn_evt_in(self.conv_evt_in(evt.flatten(0, 1))).view(T, B, self.out_channels, H, W)
 

@@ -37,6 +37,9 @@ class HybridBackbone(nn.Module):
         self.width = int(width)
         self.num_bins_mad = 5 # 来自 mad_representation config
         self.use_sdt_v3 = str(getattr(args, "backbone_type", "")).lower() == "sdtv3"
+        
+        # Check if MAD branch should be disabled
+        self.use_mad = not getattr(args, 'no_mad', False)
 
         # RGB backbone using minimal ImageBackbone; will run image path and expose 4 stages
         args_local = args
@@ -72,38 +75,43 @@ class HybridBackbone(nn.Module):
             self.fuse_modules.append(SpikeCAFR(rgb_in_channels=rgb_ch, evt_in_channels=evt_ch, out_channels=rgb_ch))
 
         # --- MAD branch ---
-        # 1. EVFlowNet (用于 T_m)
-        mad_flow_config = {
-            "base_num_channels": 32,
-            "kernel_size": 3,
-            "mask_output": True,
-        }
-        self.mad_flow = EVFlowNet(mad_flow_config, num_bins=self.num_bins_mad)
-        
-        if getattr(args, 'no_load_mad_flow', False):
-            print("\033[93mWARNING: --no_load_mad_flow is set. EVFlowNet will use random weights.\033[0m")
-        else:
-            # 这是原有的加载逻辑，现在它只在没有 --no_load_mad_flow 时执行
-            if hasattr(args, 'mad_flow_checkpoint') and args.mad_flow_checkpoint:
-                if Path(args.mad_flow_checkpoint).exists():
-                    print(f"Loading MAD EVFlowNet checkpoint from: {args.mad_flow_checkpoint}")
-                    checkpoint = torch.load(args.mad_flow_checkpoint, map_location='cpu')
-                    self.mad_flow.load_state_dict(checkpoint)
-                else:
-                    print(f"\033[91mERROR: --mad_flow_checkpoint path specified but NOT FOUND:\033[0m")
-                    print(f"  {args.mad_flow_checkpoint}")
-                    print(f"\033[91mPlease provide a valid path or use --no_load_mad_flow to proceed with random weights.\033[0m")
-
+        if self.use_mad:
+            # 1. EVFlowNet (用于 T_m)
+            mad_flow_config = {
+                "base_num_channels": 32,
+                "kernel_size": 3,
+                "mask_output": True,
+            }
+            self.mad_flow = EVFlowNet(mad_flow_config, num_bins=self.num_bins_mad)
+            
+            if getattr(args, 'no_load_mad_flow', False):
+                print("\033[93mWARNING: --no_load_mad_flow is set. EVFlowNet will use random weights.\033[0m")
             else:
-                print(f"\033[93mWARNING: --mad_flow_checkpoint not specified.\033[0m")
-                print(f"\033[93mMAD EVFlowNet will use random weights. This is not recommended for final training.\033[0m")
-        
-        self.mad_flow.eval()
-        self.mad_flow.requires_grad_(False) # 冻结
+                # 这是原有的加载逻辑，现在它只在没有 --no_load_mad_flow 时执行
+                if hasattr(args, 'mad_flow_checkpoint') and args.mad_flow_checkpoint:
+                    if Path(args.mad_flow_checkpoint).exists():
+                        print(f"Loading MAD EVFlowNet checkpoint from: {args.mad_flow_checkpoint}")
+                        checkpoint = torch.load(args.mad_flow_checkpoint, map_location='cpu')
+                        self.mad_flow.load_state_dict(checkpoint)
+                    else:
+                        print(f"\033[91mERROR: --mad_flow_checkpoint path specified but NOT FOUND:\033[0m")
+                        print(f"  {args.mad_flow_checkpoint}")
+                        print(f"\033[91mPlease provide a valid path or use --no_load_mad_flow to proceed with random weights.\033[0m")
 
+                else:
+                    print(f"\033[93mWARNING: --mad_flow_checkpoint not specified.\033[0m")
+                    print(f"\033[93mMAD EVFlowNet will use random weights. This is not recommended for final training.\033[0m")
+            
+            self.mad_flow.eval()
+            self.mad_flow.requires_grad_(False) # 冻结
 
-        # 2. MADBackbone (用于 T_a, T_m -> 特征)
-        self.mad_backbone = MADBackbone(t_a_channels=2, t_m_channels=2)
+            # 2. MADBackbone (用于 T_a, T_m -> 特征)
+            self.mad_backbone = MADBackbone(t_a_channels=2, t_m_channels=2)
+        else:
+            # MAD branch is disabled
+            self.mad_flow = None
+            self.mad_backbone = None
+            print("\033[92mMAD branch is disabled (--no_mad). Only Fused and RGB branches will be used.\033[0m")
 
         self.use_checkpointing = getattr(args, 'use_checkpointing', False)
 
@@ -262,7 +270,8 @@ class HybridBackbone(nn.Module):
         rgb_only = [x for x in rgb_feats if x is not None]
 
         mad_feats = None
-        if self.training:
+        # Only compute MAD features if MAD branch is enabled and in training mode
+        if self.use_mad and self.training:
             with torch.no_grad(): # T_m 和 T_a 的生成不应计算梯度
                 T_m, T_a = torch.zeros(1), torch.zeros(1) # 占位符
                 try:
@@ -272,13 +281,15 @@ class HybridBackbone(nn.Module):
                     b_vox, b_cnt, b_list, b_pol = mad_inputs
                     
                     # 2. 获取 T_m (运动)
-                    self.mad_flow.to(device)
-                    flow_output = self.mad_flow(b_vox.to(device), b_cnt.to(device))
-                    T_m = flow_output["flow"][0].detach() # [B, 2, H_pad, W_pad]
+                    if self.mad_flow is not None:
+                        self.mad_flow.to(device)
+                        flow_output = self.mad_flow(b_vox.to(device), b_cnt.to(device))
+                        T_m = flow_output["flow"][0].detach() # [B, 2, H_pad, W_pad]
 
-                    # 3. 获取 T_a (外观)
-
-                    T_a = self._compute_mad_appearance(T_m, b_list, b_pol, H, W).detach() # [B, 2, H, W]
+                        # 3. 获取 T_a (外观)
+                        T_a = self._compute_mad_appearance(T_m, b_list, b_pol, H, W).detach() # [B, 2, H, W]
+                    else:
+                        raise RuntimeError("MAD flow model is None but use_mad is True")
                 
                 except Exception as e:
                     print(f"[HybridDebug] MAD T_a/T_m 生成失败: {e}")
@@ -299,14 +310,15 @@ class HybridBackbone(nn.Module):
 
 
 
-            if self.use_checkpointing:
-                mad_feats = activation_checkpoint(self.mad_backbone, T_a_padded_for_backbone, T_m_padded_for_backbone, use_reentrant=False)
-            else:
-                mad_feats = self.mad_backbone(T_a_padded_for_backbone, T_m_padded_for_backbone)
+            if self.mad_backbone is not None:
+                if self.use_checkpointing:
+                    mad_feats = activation_checkpoint(self.mad_backbone, T_a_padded_for_backbone, T_m_padded_for_backbone, use_reentrant=False)
+                else:
+                    mad_feats = self.mad_backbone(T_a_padded_for_backbone, T_m_padded_for_backbone)
 
-            # Align MAD scales with current strides (drop P2 when using SDT-V3)
-            if mad_feats is not None and len(mad_feats) > self.num_scales:
-                mad_feats = mad_feats[-self.num_scales:]
+                # Align MAD scales with current strides (drop P2 when using SDT-V3)
+                if mad_feats is not None and len(mad_feats) > self.num_scales:
+                    mad_feats = mad_feats[-self.num_scales:]
         # --- MAD branch end ---
 
         # mad_feats=None in inference

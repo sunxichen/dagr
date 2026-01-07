@@ -12,6 +12,8 @@ export DISTRIBUTED=0
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
 export WANDB_MODE=disabled
 export NO_EVAL=${NO_EVAL:-0}
+# 是否开启mad第三分支训练，1不开启，0开启
+export NO_MAD=${NO_MAD:-1}
 
 # Python 与 启动命令
 PYTHON=python
@@ -60,13 +62,6 @@ SDT_SR_RATIO=4                  # 保持 4 以获得较好的表征能力
 BATCH_SIZE=16
 EPOCHS=801
 # 注意：实际学习率 = LR * sqrt(BATCH_SIZE) / sqrt(64)
-# 对于batch_size=16，实际lr = LR * 0.5
-# 测试结果总结：
-# - LR=0.0002 (实际lr=0.0001): mAP低但稳定，大部分epoch有非零值（推荐）
-# - LR=0.0004 (实际lr=0.0002): 不稳定，大部分epoch mAP=0
-# - LR=0.0006 (实际lr=0.0003): 最不稳定
-# 结论：对于SDT V3 + DSEC，LR=0.0002是最稳定的选择
-# 虽然收敛慢，但至少能稳定训练。mAP低可能是其他问题（数据、模型架构等）
 LR=0.0002
 WEIGHT_DECAY=0.00001
 
@@ -83,6 +78,11 @@ echo "Training log will be saved to: $LOG_FILE"
 echo "Starting training..."
 echo "Mode: PRETRAINED_WEIGHT='${PRETRAINED_WEIGHT}'"
 echo "Dims: ${SDT_EMBED_DIMS}"
+if [[ "${NO_MAD}" -eq 1 ]]; then
+  echo "MAD branch: DISABLED (--no_mad). Using 2-branch mode (Fused + RGB only)."
+else
+  echo "MAD branch: ENABLED. Using 3-branch mode (Fused + RGB + MAD)."
+fi
 
 # ------------------------------------------------------------------------------
 # 4. 参数组装与启动
@@ -94,7 +94,14 @@ if [[ "${NO_EVAL}" -eq 1 ]]; then
   NO_EVAL_FLAG+=(--no_eval)
 fi
 
+NO_MAD_FLAG=()
+if [[ "${NO_MAD}" -eq 1 ]]; then
+  NO_MAD_FLAG+=(--no_mad)
+fi
+
 # 组装通用参数
+# 去掉--use_image只打开sdtv3训练
+# 加上--use_image，根据NO_MAD变量的情况，判断是否打开第三分支
 COMMON_ARGS=(
   --config config/dagr-s-dsec.yaml
   --dataset "$DATASET"
@@ -106,6 +113,8 @@ COMMON_ARGS=(
   --weight_decay "$WEIGHT_DECAY"
   --exp_trend "$EXP_TREND"
   --use_snn_backbone
+  --use_image
+  --img_net resnet18
   --backbone_type "$BACKBONE_TYPE"
   --sdt_T "$SDT_T"
   --sdt_in_channels "$SDT_IN_CHANNELS"
@@ -117,6 +126,7 @@ COMMON_ARGS=(
   --sdt_sr_ratio "$SDT_SR_RATIO"
   --dataset_directory "$DATASET_DIR"
   "${NO_EVAL_FLAG[@]}"
+  "${NO_MAD_FLAG[@]}"
 )
 
 # 添加 Checkpoint 标志
