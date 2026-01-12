@@ -22,6 +22,8 @@ def BASE_FLAGS():
 
     parser.add_argument("--config", type=Path, default="../config/detection.yaml")
     parser.add_argument("--use_image", action="store_true")
+    parser.add_argument("--no_mad", action="store_true",
+                        help="Disable MAD branch when using --use_image. Only use two branches (sdtv3/snn + image) instead of three.")
     parser.add_argument("--no_events", action="store_true")
     parser.add_argument("--pretrain_cnn", action="store_true")
     parser.add_argument("--keep_temporal_ordering", action="store_true")
@@ -63,6 +65,31 @@ def BASE_FLAGS():
     parser.add_argument("--snn_yaml_path", default=argparse.SUPPRESS, type=str, help="Path to SNN YAML config file")
     parser.add_argument("--snn_scale", default=argparse.SUPPRESS, type=str, help="Model scale for SNN backbone (e.g., s/m/l)")
     parser.add_argument("--snn_temporal_bins", type=int, default=4, help="Temporal bins T for SNN voxelization (default: 4)")
+    parser.add_argument("--backbone_type", default=argparse.SUPPRESS, type=str,
+                        help="Backbone selector: set to 'sdtv3' to use Spike-Driven Transformer V3")
+    parser.add_argument("--sdt_T", type=int, default=argparse.SUPPRESS, help="Time steps for SDT-V3 (default: 4)")
+    parser.add_argument("--sdt_repeat_static", action="store_true",
+                        help="Repeat static BCHW input across T for SDT-V3")
+    parser.add_argument("--sdt_input_t_first", action="store_true",
+                        help="Set if SDT-V3 inputs are already (T,B,C,H,W); default assumes (B,T,C,H,W)")
+    parser.add_argument("--sdt_checkpoint", action="store_true",
+                        help="Force activation checkpointing inside SDT-V3 backbone")
+    parser.add_argument("--sdt_in_channels", type=int, default=argparse.SUPPRESS,
+                        help="Input channels for SDT-V3 (2 for events, 3 for RGB)")
+    parser.add_argument("--sdt_depths", nargs="+", type=int, default=argparse.SUPPRESS,
+                        help="Depths (number of blocks) for each stage of SDT-V3 (e.g., 2 2 6 2)")
+    parser.add_argument("--sdt_num_heads", type=int, default=argparse.SUPPRESS,
+                        help="Number of attention heads for SDT-V3 (default: 8)")
+    parser.add_argument("--sdt_mlp_ratio", type=float, default=argparse.SUPPRESS,
+                        help="MLP expansion ratio for SDT-V3 (default: 4.0)")
+    parser.add_argument("--sdt_embed_dim", nargs="+", type=int, default=argparse.SUPPRESS,
+                        help="Embedding dims list for SDT-V3 (len>=4, e.g., 128 256 512 640)")
+    parser.add_argument("--sdt_norm", type=float, default=argparse.SUPPRESS,
+                        help="Spike normalization (lens) used by SDT-V3 (default: 4.0)")
+    parser.add_argument("--sdt_sr_ratio", type=int, default=1, 
+                        help="Spatial-Reduction ratio / Value expansion ratio for SDT-V3 attention (default: 1). Checkpoints often use 4.")
+    parser.add_argument("--load_pretrained_weight", default=None, type=str,
+                        help="Path to pretrained .pth weights for SDT-V3 backbone (classification head will be skipped)")
 
     return parser
 
@@ -99,7 +126,7 @@ def FLAGS():
         args.checkpoint = Path(args.checkpoint)
     
     # --- Modified for 3-branch hybrid backbone (Fused, RGB, MAD) ---
-    if args.mad_flow_checkpoint is not None:
+    if getattr(args, 'mad_flow_checkpoint', None) is not None:
         args.mad_flow_checkpoint = Path(args.mad_flow_checkpoint)
     # --- Modified end ---
 
@@ -125,7 +152,7 @@ def FLOPS_FLAGS():
         args.checkpoint = Path(args.checkpoint)
 
     # --- Modified for 3-branch hybrid backbone (Fused, RGB, MAD) ---
-    if args.mad_flow_checkpoint is not None:
+    if getattr(args, 'mad_flow_checkpoint', None) is not None:
         args.mad_flow_checkpoint = Path(args.mad_flow_checkpoint)
     # --- Modified end ---
 

@@ -65,7 +65,7 @@ class DSEC(Dataset):
                  min_bbox_diag=0,
                  min_bbox_height=0,
                  scale=2,
-                 cropped_height=430,
+                 cropped_height=448,
                  only_perfect_tracks=False,
                  demo=False,
                  no_eval=False):
